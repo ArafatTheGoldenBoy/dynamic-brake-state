@@ -997,8 +997,30 @@ class WorldManager:
             )
 
             def _on_collision(event):  # type: ignore[arg-type]
+                other_name = 'unknown'
+                impulse_mag = None
                 try:
-                    self.collision_happened = True
+                    other = getattr(event, 'other_actor', None)
+                    if other is not None:
+                        other_name = getattr(other, 'type_id', str(other))
+                except Exception:
+                    pass
+                try:
+                    impulse = getattr(event, 'normal_impulse', None)
+                    if impulse is not None:
+                        impulse_mag = math.sqrt(float(impulse.x)**2 + float(impulse.y)**2 + float(impulse.z)**2)
+                except Exception:
+                    impulse_mag = None
+                self.collision_happened = True
+                self.collision_last_actor = other_name
+                self.collision_last_impulse = impulse_mag
+                self.collision_last_time = time.time()
+
+                try:
+                    if impulse_mag is not None:
+                        print(f"[COLLISION] Contact with {other_name} | impulse={impulse_mag:.1f}")
+                    else:
+                        print(f"[COLLISION] Contact with {other_name}")
                 except Exception:
                     pass
 
@@ -1179,6 +1201,9 @@ class _ScenarioLogger:
 
     def __init__(self, path: str):
         import csv
+        folder = os.path.dirname(os.path.abspath(path))
+        if folder:
+            os.makedirs(folder, exist_ok=True)
         self._f = open(path, 'w', newline='')
         self._w = csv.writer(self._f)
         self._w.writerow([
@@ -1186,6 +1211,7 @@ class _ScenarioLogger:
             'v_init_mps', 's_init_m', 's_min_m',
             'stopped', 't_to_stop_s', 'collision'
         ])
+        self._f.flush()
 
     def log(self, scenario: str, trigger_kind: str, mu: float,
             v_init: float, s_init: float, s_min: float,
@@ -1201,6 +1227,7 @@ class _ScenarioLogger:
             float(t_to_stop),
             bool(collision),
         ])
+        self._f.flush()
 
     def close(self):
         try:
@@ -1278,7 +1305,8 @@ class App:
                    frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
                    hold_reason, no_trigger_elapsed, no_red_elapsed, stop_armed,
                    stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
-                   dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target):
+                   dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target,
+                   collision_flag: bool):
         if self.headless:
             return
         surf_front = bgr_to_pygame_surface(bgr)
@@ -1298,6 +1326,8 @@ class App:
         if dbg_tau_dyn is not None:
             shadow(screen, f'tau={dbg_tau_dyn:0.2f}  Dsafe={dbg_D_safety_dyn:0.1f} m  sigma={dbg_sigma_depth:0.2f} m  gate={int(dbg_gate_hit)}  a_des={dbg_a_des:0.2f}  brk={dbg_brake:0.2f}  Vtgt={v_target*3.6:0.0f}km/h',
                    (10, IMG_H-24), (255,255,0))
+        if collision_flag:
+            shadow(screen, '*** COLLISION DETECTED ***', (IMG_W//4, IMG_H//2), (255,40,40))
         pygame.display.flip()
 
     # --- IO: read sensors and decode ---
@@ -1591,26 +1621,51 @@ class App:
         throttle = 0.0; brake = 0.0; ctrl = None
         hold_blocked = getattr(self, '_hold_blocked', False)
         hold_reason  = getattr(self, '_hold_reason', None)
-        in_brake_band = False
+
+        reason_object = False
+        reason_stop   = False
+        reason_red    = False
 
         if (nearest_s_active is not None) and (nearest_thr is not None) and (nearest_s_active <= nearest_thr):
-            in_brake_band = True
-        if (not in_brake_band) and stop_armed and (not hold_blocked):
-            in_brake_band = True
+            reason_object = True
+        elif stop_armed and (not hold_blocked):
+            reason_stop = True
             if nearest_s_active is None and (last_s0 is not None):
                 nearest_s_active = last_s0
-            if trigger_name is None: trigger_name = 'stop sign'
-            nearest_thr = S_ENGAGE
-        if (not in_brake_band) and (tl_state == 'RED') and (tl_s_active is not None) and (tl_s_active <= S_ENGAGE_TL):
-            in_brake_band = True
+        elif (tl_state == 'RED') and (tl_s_active is not None) and (tl_s_active <= S_ENGAGE_TL):
+            reason_red = True
             nearest_s_active = tl_s_active
+
+        in_brake_band = reason_object or reason_stop or reason_red
+
+        brake_reason = None
+        if reason_stop:
+            brake_reason = 'stop_sign'
+        elif reason_red:
+            brake_reason = 'red_light'
+        elif reason_object:
+            brake_reason = 'obstacle'
+        if brake_reason is None and trigger_name:
+            tnorm = trigger_name.lower()
+            if 'stop' in tnorm and 'sign' in tnorm:
+                brake_reason = 'stop_sign'
+            elif 'traffic' in tnorm and 'light' in tnorm:
+                brake_reason = 'red_light'
+
+        if reason_stop:
+            if trigger_name is None:
+                trigger_name = 'stop sign'
+            nearest_thr = S_ENGAGE
+        if reason_red:
             nearest_thr = S_ENGAGE_TL
             trigger_name = 'traffic light (RED)'
 
         if in_brake_band and trigger_name and ('stop sign' in trigger_name) and (stop_release_ignore_until >= 0) and (self._sim_time < stop_release_ignore_until):
             in_brake_band = False
 
-        dbg = {'tau_dyn': None, 'D_safety_dyn': None, 'sigma_depth': None, 'gate_hit': False, 'a_des': None, 'brake': None}
+        dbg = {'tau_dyn': None, 'D_safety_dyn': None, 'sigma_depth': None, 'gate_hit': False,
+               'a_des': None, 'brake': None, 'brake_active': in_brake_band,
+               'brake_reason': brake_reason, 'brake_target_dist': nearest_s_active}
 
         if in_brake_band and (nearest_s_active is not None):
             s_used = 0.7 * (last_s0 if last_s0 is not None else nearest_s_active) + 0.3 * nearest_s_active
@@ -1641,11 +1696,13 @@ class App:
                     hold_reason = 'red_light'
                 elif trigger_name and 'stop sign' in trigger_name:
                     hold_reason = 'stop_sign'; stop_latch_time = self._sim_time; stop_armed = False
-                else:
-                    hold_reason = 'obstacle'
+            else:
+                hold_reason = 'obstacle'
 
             dbg.update({'tau_dyn': tau_dyn, 'D_safety_dyn': D_safety_dyn, 'sigma_depth': sigma_depth,
-                        'gate_hit': gate_hit, 'a_des': a_des, 'brake': brake})
+                        'gate_hit': gate_hit, 'a_des': a_des, 'brake': brake,
+                        'brake_reason': brake_reason, 'brake_target_dist': nearest_s_active,
+                        'brake_active': True})
 
         elif hold_blocked:
             release = False
@@ -1847,6 +1904,12 @@ class App:
         episode_s_init = 0.0
         episode_s_min = float('inf')
         episode_t_start = 0.0
+        if not hasattr(self, '_prev_brake_activation'):
+            self._prev_brake_activation = False
+        if not hasattr(self, '_collision_logged_count'):
+            self._collision_logged_count = 0
+        collision_event_time = getattr(self, '_collision_last_time', -1.0)
+        collision_logged_count = getattr(self, '_collision_logged_count', 0)
 
         try:
             t0 = time.time()
@@ -1973,21 +2036,56 @@ class App:
                 dbg_gate_hit = dbg_map.get('gate_hit')
                 dbg_a_des = dbg_map.get('a_des')
                 dbg_brake = dbg_map.get('brake')
+                brake_active = bool(dbg_map.get('brake_active'))
+                brake_reason = dbg_map.get('brake_reason')
+                brake_target = dbg_map.get('brake_target_dist')
+                if (not brake_reason) and hold_blocked and hold_reason in ('stop_sign','red_light','obstacle'):
+                    brake_reason = hold_reason
+                current_dist = None
+                for cand in (brake_target, nearest_s_active, tl_s_active if tl_state == 'RED' else None, last_s0):
+                    if cand is None:
+                        continue
+                    try:
+                        val = float(cand)
+                    except Exception:
+                        continue
+                    if not math.isfinite(val):
+                        continue
+                    current_dist = val
+                    break
 
                 # --- Episode bookkeeping: start/end of braking events ---
-                if (not episode_active) and dbg_gate_hit and (nearest_s_active is not None):
+                reason_allowed = brake_reason in ('obstacle','stop_sign','red_light')
+                hold_brake = hold_blocked and hold_reason in ('stop_sign','red_light','obstacle')
+                activation = reason_allowed and (brake_active or hold_brake)
+                prev_activation = bool(getattr(self, '_prev_brake_activation', False))
+                if (not episode_active) and activation and (not prev_activation):
+                    start_dist = current_dist
+                    if start_dist is None:
+                        if last_s0 is not None:
+                            start_dist = float(last_s0)
+                        elif nearest_thr is not None:
+                            start_dist = float(nearest_thr)
+                        else:
+                            start_dist = float(S_ENGAGE)
                     episode_active = True
-                    episode_trigger = trigger_name or 'unknown'
+                    if brake_reason == 'stop_sign':
+                        episode_trigger = 'stop sign'
+                    elif brake_reason == 'red_light':
+                        episode_trigger = 'traffic light (RED)'
+                    else:
+                        episode_trigger = trigger_name or 'unknown'
                     episode_v_init = v
-                    episode_s_init = nearest_s_active
-                    episode_s_min = nearest_s_active
+                    episode_s_init = float(start_dist)
+                    episode_s_min = float(start_dist)
                     episode_t_start = sim_time
                 elif episode_active:
-                    if nearest_s_active is not None:
-                        episode_s_min = min(episode_s_min, nearest_s_active)
+                    if current_dist is not None:
+                        episode_s_min = min(episode_s_min, current_dist)
+                    still_active = activation
                     # Episode considered finished once vehicle has effectively stopped
-                    # or gate is no longer hit (returned to cruising).
-                    if (v < V_STOP) or (not dbg_gate_hit):
+                    # or braking band / hold is released (returned to cruising).
+                    if (v < V_STOP) or (not still_active):
                         stopped = (v < V_STOP)
                         t_to_stop = max(0.0, sim_time - episode_t_start)
                         if self.scenario_logger is not None:
@@ -2007,6 +2105,9 @@ class App:
                                 pass
                         episode_active = False
                         episode_trigger = None
+                        self._collision_logged_count = getattr(self, '_collision_logged_count', 0)
+
+                self._prev_brake_activation = activation
 
                 steer = self._steer_to_waypoint(v)
 
@@ -2023,12 +2124,14 @@ class App:
                     except Exception:
                         pass
 
+                collision_flag = bool(getattr(self.world, 'collision_happened', False))
                 if not self.headless:
                     self._draw_hud(self.screen, bgr, img_top, perf_fps, perf_ms, x, y, z, yaw, compass,
                                    frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
                                    hold_reason, no_trigger_elapsed, no_red_elapsed, stop_armed,
                                    stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
-                                   dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target)
+                                   dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target,
+                                   collision_flag)
 
                 # Periodic concise console log for tuning
                 logN = int(getattr(self.args, 'log_interval_frames', 0) or 0)
@@ -2036,7 +2139,34 @@ class App:
                     print(f"frame={frame_id} fps={perf_fps:.1f} v={v:4.1f} Vtgt={v_target:4.1f} mu={MU:.2f} "
                           f"mode={self.args.range_est} conf={self.detector.conf_thr:.2f} TL={tl_state} trig={trigger_name or 'None'} "
                           f"s_act={(None if nearest_s_active is None else f'{nearest_s_active:.1f}')} thr={(None if nearest_thr is None else f'{nearest_thr:.1f}')} "
-                          f"thr_cmd={throttle:.2f} brk={brake:.2f} hold={hold_blocked}")
+                          f"thr_cmd={throttle:.2f} brk={brake:.2f} hold={hold_blocked} collision={collision_flag}")
+
+                if collision_flag and self.scenario_logger is not None:
+                    last_log_time = getattr(self, '_collision_last_log_time', None)
+                    sensor_time = getattr(self.world, 'collision_last_time', None)
+                    # Avoid duplicate writes if sensor reports multiple times per frame
+                    should_log_collision = False
+                    if sensor_time is None:
+                        should_log_collision = last_log_time is None
+                    else:
+                        should_log_collision = (last_log_time is None) or (abs(sensor_time - last_log_time) > 1e-3)
+                    if should_log_collision:
+                        try:
+                            self.scenario_logger.log(
+                                getattr(self.args, 'scenario_tag', 'default'),
+                                'collision',
+                                MU,
+                                float(v),
+                                float(nearest_s_active or 0.0),
+                                float(nearest_s_active or 0.0),
+                                bool(v < V_STOP),
+                                0.0,
+                                True,
+                            )
+                        except Exception:
+                            pass
+                        self._collision_last_log_time = sensor_time if sensor_time is not None else sim_time
+                        self._collision_logged_count = getattr(self, '_collision_logged_count', 0) + 1
 
                 loop_ms = (time.time() - tic) * 1000.0
                 perf_ms = loop_ms
@@ -2115,6 +2245,11 @@ class App:
             if self.telemetry is not None:
                 try:
                     self.telemetry.close()
+                except Exception:
+                    pass
+            if self.scenario_logger is not None:
+                try:
+                    self.scenario_logger.close()
                 except Exception:
                     pass
             if self.video_writer is not None:
