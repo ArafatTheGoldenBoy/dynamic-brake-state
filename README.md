@@ -153,6 +153,34 @@ python dynamic_brake_state.py --preset fast --headless --no-opencv
       --tag stereo
     ```
 
+- **Lead vehicle stereo scenario (15 m/s)**
+  - Example CARLA run with a lead vehicle scenario at ~15 m/s, logging telemetry, scenarios, range comparisons, and stereo-vs-depth errors while spawning extra NPC traffic:
+
+    ```powershell
+    python dynamic_brake_state.py `
+      --stereo-cuda `
+      --scenario-tag lead_vehicle_15mps1 `
+      --scenario-csv logs/scenarios_lead_vehicle_yolo12_stereo1.csv `
+      --telemetry-csv logs/telemetry_lead_vehicle_yolo12_stereo1.csv `
+      --range-est stereo `
+      --compare-csv logs/ranges_lead_vehicle_yolo12_stereo1.csv `
+      --stereo-compare-csv logs/stereo_vs_depth_lead_vehicle1.csv `
+      --log-interval-frames 10 `
+      --npc-vehicles 40
+    ```
+
+  - Offline analysis for this lead-vehicle stereo run:
+
+    ```powershell
+    python results_analysis.py `
+      --telemetry-csv logs/telemetry_lead_vehicle_yolo12_stereo1.csv `
+      --scenario-csv logs/scenarios_lead_vehicle_yolo12_stereo1.csv `
+      --compare-csv logs/ranges_lead_vehicle_yolo12_stereo1.csv `
+      --stereo-compare-csv logs/stereo_vs_depth_lead_vehicle1.csv `
+      --out-dir results_lead_vehicle `
+      --tag lead_vehicle
+    ```
+
 For more detailed experiment recipes and thesis‑style result suggestions, see `RESULTS.md`.
 
 ---
