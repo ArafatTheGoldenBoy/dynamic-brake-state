@@ -123,6 +123,16 @@ OBJ_HEIGHT_M = {
 # Debug toggle for traffic light mask visualization (kept)
 DEBUG_TL = True
 
+
+class BaseDetector:
+    """Minimal detector interface so we can swap YOLO, SSD, etc.
+
+    Implementors must provide predict_raw(bgr) -> (classIds, confs, boxes).
+    """
+
+    def predict_raw(self, bgr: np.ndarray):
+        raise NotImplementedError
+
 # ---------- label normalization ----------
 def _norm_label(s: str) -> str:
     return ''.join(ch for ch in s.lower() if ch.isalpha())  # 'traffic light' -> 'trafficlight'
@@ -414,7 +424,7 @@ class EgoState:
     t: float
 
 # ===================== components =====================
-class YOLODetector:
+class YOLODetector(BaseDetector):
     def __init__(self,
                  conf_thr: float = CONF_THR_DEFAULT,
                  nms_thr: float = NMS_THR,
@@ -940,6 +950,8 @@ class WorldManager:
         self.npc_vehicles = []
         self.npc_walkers = []
         self.walker_controllers = []
+        self.collision_sensor = None
+        self.collision_happened = False
 
         bp_lib = self.world.get_blueprint_library()
         try:
@@ -952,6 +964,25 @@ class WorldManager:
             ego = self.world.spawn_actor(ego_bp, random.choice(self.map.get_spawn_points()))
         ego.set_autopilot(False)
         self.ego = ego
+
+        # Attach a simple collision sensor to log collisions for results.
+        try:
+            col_bp = bp_lib.find('sensor.other.collision')
+            self.collision_sensor = self.world.spawn_actor(
+                col_bp,
+                carla.Transform(),
+                attach_to=self.ego,
+            )
+
+            def _on_collision(event):  # type: ignore[arg-type]
+                try:
+                    self.collision_happened = True
+                except Exception:
+                    pass
+
+            self.collision_sensor.listen(_on_collision)
+        except Exception:
+            self.collision_sensor = None
 
         try:
             phys = self.ego.get_physics_control()
@@ -979,6 +1010,13 @@ class WorldManager:
         return self.world.tick()
 
     def destroy(self):
+        # Destroy collision sensor if present
+        try:
+            if self.collision_sensor is not None:
+                self.collision_sensor.stop()
+                self.collision_sensor.destroy()
+        except Exception:
+            pass
         # Stop walker controllers first
         try:
             for c in self.walker_controllers:
@@ -1110,6 +1148,43 @@ class _TelemetryLogger:
             self._csv_f.close()
         except Exception:
             pass
+class _ScenarioLogger:
+    """High-level braking/scenario outcomes for thesis-style results.
+
+    Each row captures one braking episode: initial speed/distance, minimum
+    distance, whether the ego stopped, and time-to-stop.
+    """
+
+    def __init__(self, path: str):
+        import csv
+        self._f = open(path, 'w', newline='')
+        self._w = csv.writer(self._f)
+        self._w.writerow([
+            'scenario', 'trigger_kind', 'mu',
+            'v_init_mps', 's_init_m', 's_min_m',
+            'stopped', 't_to_stop_s', 'collision'
+        ])
+
+    def log(self, scenario: str, trigger_kind: str, mu: float,
+            v_init: float, s_init: float, s_min: float,
+            stopped: bool, t_to_stop: float, collision: bool):
+        self._w.writerow([
+            scenario,
+            trigger_kind,
+            float(mu),
+            float(v_init),
+            float(s_init),
+            float(s_min),
+            bool(stopped),
+            float(t_to_stop),
+            bool(collision),
+        ])
+
+    def close(self):
+        try:
+            self._f.close()
+        except Exception:
+            pass
 class App:
     def __init__(self, args):
         self.args = args
@@ -1149,6 +1224,23 @@ class App:
                 self.telemetry = _TelemetryLogger(self.args.telemetry_csv, getattr(self.args, 'telemetry_hz', 10.0))
             except Exception:
                 self.telemetry = None
+        # Scenario/braking logger
+        self.scenario_logger: Optional[_ScenarioLogger] = None
+        if getattr(self.args, 'scenario_csv', None):
+            try:
+                self.scenario_logger = _ScenarioLogger(self.args.scenario_csv)
+            except Exception:
+                self.scenario_logger = None
+
+        # Optional video writer for qualitative figures
+        self.video_writer = None
+        self.video_out_path = getattr(self.args, 'video_out', None)
+        if self.video_out_path and (not self.headless):
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                self.video_writer = cv2.VideoWriter(self.video_out_path, fourcc, 1.0/DT, (IMG_W, IMG_H))
+            except Exception:
+                self.video_writer = None
 
     def _draw_hud(self, screen, bgr, img_top, perf_fps, perf_ms, x, y, z, yaw, compass,
                    frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
@@ -1383,7 +1475,8 @@ class App:
                          depth_m: np.ndarray, depth_stereo_m: Optional[np.ndarray]) -> Tuple[float, float, float]:
         if not hasattr(self, '_sigma_depth_ema'): self._sigma_depth_ema = 0.40
         if not hasattr(self, '_D_safety_dyn_prev'): self._D_safety_dyn_prev = D_MIN
-        latency_s = max(DT, ema_loop_ms/1000.0) + 0.03
+        extra_ms = float(getattr(self.args, 'extra_latency_ms', 0.0) or 0.0)
+        latency_s = max(DT, (ema_loop_ms + extra_ms)/1000.0) + 0.03
         sd = None
         try:
             if (self.args.range_est in ('depth','both')) and (nearest_box is not None):
@@ -1654,6 +1747,14 @@ class App:
         dbg_a_des = None
         dbg_brake = None
 
+        # Braking episode tracking for scenario-level results
+        episode_active = False
+        episode_trigger = None
+        episode_v_init = 0.0
+        episode_s_init = 0.0
+        episode_s_min = float('inf')
+        episode_t_start = 0.0
+
         try:
             t0 = time.time()
             while True:
@@ -1780,6 +1881,40 @@ class App:
                 dbg_a_des = dbg_map.get('a_des')
                 dbg_brake = dbg_map.get('brake')
 
+                # --- Episode bookkeeping: start/end of braking events ---
+                if (not episode_active) and dbg_gate_hit and (nearest_s_active is not None):
+                    episode_active = True
+                    episode_trigger = trigger_name or 'unknown'
+                    episode_v_init = v
+                    episode_s_init = nearest_s_active
+                    episode_s_min = nearest_s_active
+                    episode_t_start = sim_time
+                elif episode_active:
+                    if nearest_s_active is not None:
+                        episode_s_min = min(episode_s_min, nearest_s_active)
+                    # Episode considered finished once vehicle has effectively stopped
+                    # or gate is no longer hit (returned to cruising).
+                    if (v < V_STOP) or (not dbg_gate_hit):
+                        stopped = (v < V_STOP)
+                        t_to_stop = max(0.0, sim_time - episode_t_start)
+                        if self.scenario_logger is not None:
+                            try:
+                                self.scenario_logger.log(
+                                    getattr(self.args, 'scenario_tag', 'default'),
+                                    str(episode_trigger or 'unknown'),
+                                    MU,
+                                    episode_v_init,
+                                    episode_s_init,
+                                    episode_s_min if math.isfinite(episode_s_min) else episode_s_init,
+                                    bool(stopped),
+                                    t_to_stop,
+                                    bool(self.world.collision_happened if self.world is not None else False),
+                                )
+                            except Exception:
+                                pass
+                        episode_active = False
+                        episode_trigger = None
+
                 steer = self._steer_to_waypoint(v)
 
                 if ctrl is not None:
@@ -1787,6 +1922,13 @@ class App:
                     self.world.ego.apply_control(ctrl)
                 else:
                     self.world.ego.apply_control(carla.VehicleControl(throttle=float(throttle), brake=float(brake), steer=float(steer), hand_brake=False))
+
+                # Optional video recording of front RGB (for qualitative figures)
+                if self.video_writer is not None and not self.headless:
+                    try:
+                        self.video_writer.write(bgr)
+                    except Exception:
+                        pass
 
                 if not self.headless:
                     self._draw_hud(self.screen, bgr, img_top, perf_fps, perf_ms, x, y, z, yaw, compass,
@@ -1833,6 +1975,15 @@ class App:
                             elif e.key == pygame.K_0:
                                 v_target = float(V_TARGET)
                                 hud_msg = f'Vtgt reset -> {V_TARGET*3.6:.0f} km/h'; hud_until = sim_time + 2.0
+                            elif e.key == pygame.K_s:
+                                # Save a snapshot of current front RGB for figures
+                                try:
+                                    snap_name = f'snapshot_{frame_id}.png'
+                                    cv2.imwrite(snap_name, bgr)
+                                    hud_msg = f'Snapshot saved: {snap_name}'
+                                    hud_until = sim_time + 2.0
+                                except Exception:
+                                    pass
 
                 # Telemetry
                 if self.telemetry is not None:
@@ -1873,6 +2024,11 @@ class App:
                     self.telemetry.close()
                 except Exception:
                     pass
+            if self.video_writer is not None:
+                try:
+                    self.video_writer.release()
+                except Exception:
+                    pass
             try:
                 dt_w = (t1 - t0) * 1000.0
                 dt_s = (t2 - t1) * 1000.0
@@ -1908,6 +2064,9 @@ def parse_args():
                         help='Disable spawning the depth camera (range_est depth will be auto-fallback)')
     parser.add_argument('--headless', action='store_true',
                         help='Run without GUI windows (also disables OpenCV windows)')
+
+    parser.add_argument('--video-out', type=str, default=None,
+                        help='Optional path to write an MP4 video of the front RGB view (qualitative results)')
 
     # YOLO options
     parser.add_argument('--yolo-img', type=int, default=640,
@@ -1955,6 +2114,20 @@ def parse_args():
                         help='Telemetry logging frequency in Hz (default 10)')
     parser.add_argument('--log-interval-frames', type=int, default=5,
                         help='Print a concise state line to the console every N frames (0 to disable)')
+
+    # Scenario / results logging options
+    parser.add_argument('--scenario-tag', type=str, default='default',
+                        help='Freeform tag to identify this run/scenario in results CSVs')
+    parser.add_argument('--scenario-csv', type=str, default=None,
+                        help='If set, write high-level braking episode summaries to this CSV path')
+
+    # Ablation knob: artificial extra latency added to safety-envelope computation
+    parser.add_argument('--extra-latency-ms', type=float, default=0.0,
+                        help='Artificial extra latency (ms) added in safety envelope for sensitivity studies')
+
+    # Detector selection (future extension: MobileNetSSD, etc.)
+    parser.add_argument('--detector', type=str, default='yolo', choices=['yolo'],
+                        help='Perception backend: currently only "yolo" is implemented; hook for future detectors')
 
     # NPC options
     parser.add_argument('--npc-vehicles', type=int, default=15, help='Number of NPC vehicles to spawn')
