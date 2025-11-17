@@ -123,6 +123,13 @@ OBJ_HEIGHT_M = {
 # Debug toggle for traffic light mask visualization (kept)
 DEBUG_TL = True
 
+# Depth / stereo ROI + fusion defaults
+DEPTH_ROI_SHRINK_DEFAULT   = 0.40
+STEREO_ROI_SHRINK_DEFAULT  = 0.30
+STEREO_FUSE_NEAR_WEIGHT    = 0.75  # close objects -> trust depth camera more
+STEREO_FUSE_FAR_WEIGHT     = 0.45  # far objects -> lean slightly toward stereo
+STEREO_FUSE_DISAGREE_M     = 12.0  # beyond this delta, pick the safer (closer) estimate
+
 
 class BaseDetector:
     """Minimal detector interface so we can swap YOLO, SSD, etc.
@@ -361,6 +368,21 @@ def depth_sigma_in_box(depth_m: np.ndarray, box, shrink: float = 0.4):
     med = np.median(flat); mad = np.median(np.abs(flat - med))
     sigma = 1.4826 * mad
     return float(sigma) if np.isfinite(sigma) and sigma > 0 else None
+
+def fuse_depth_sources(s_depth: Optional[float], s_stereo: Optional[float], box_h_px: int) -> Tuple[Optional[float], str]:
+    """Blend CARLA depth and stereo ranges inside a detection ROI."""
+    if s_depth is None and s_stereo is None:
+        return None, 'none'
+    if s_depth is None:
+        return s_stereo, 'stereo'
+    if s_stereo is None:
+        return s_depth, 'depth'
+    prox = max(0.0, min(1.0, float(box_h_px) / max(1.0, float(IMG_H))))
+    w_depth = STEREO_FUSE_FAR_WEIGHT + (STEREO_FUSE_NEAR_WEIGHT - STEREO_FUSE_FAR_WEIGHT) * prox
+    fused = (w_depth * s_depth) + ((1.0 - w_depth) * s_stereo)
+    if abs(s_depth - s_stereo) > STEREO_FUSE_DISAGREE_M:
+        return min(s_depth, s_stereo), 'min'
+    return fused, 'fused'
 
 # Simple ROI TL classifier (fallback if CARLA API not reliable)
 def estimate_tl_color_from_roi(bgr: np.ndarray, box: Tuple[int,int,int,int]) -> str:
@@ -1242,6 +1264,16 @@ class App:
             except Exception:
                 self.video_writer = None
 
+        # ROI tuning knobs for depth / stereo sampling
+        try:
+            self.depth_roi_shrink = max(0.0, min(0.9, float(getattr(self.args, 'depth_roi_shrink', DEPTH_ROI_SHRINK_DEFAULT))))
+        except Exception:
+            self.depth_roi_shrink = DEPTH_ROI_SHRINK_DEFAULT
+        try:
+            self.stereo_roi_shrink = max(0.0, min(0.9, float(getattr(self.args, 'stereo_roi_shrink', STEREO_ROI_SHRINK_DEFAULT))))
+        except Exception:
+            self.stereo_roi_shrink = STEREO_ROI_SHRINK_DEFAULT
+
     def _draw_hud(self, screen, bgr, img_top, perf_fps, perf_ms, x, y, z, yaw, compass,
                    frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
                    hold_reason, no_trigger_elapsed, no_red_elapsed, stop_armed,
@@ -1322,6 +1354,10 @@ class App:
         det_points: List[Dict[str, Any]] = []
         depth_cache_depth: Dict[Tuple[int,int,int,int], Optional[float]] = {}
         depth_cache_stereo: Dict[Tuple[int,int,int,int], Optional[float]] = {}
+        depth_roi = getattr(self, 'depth_roi_shrink', DEPTH_ROI_SHRINK_DEFAULT)
+        stereo_roi = getattr(self, 'stereo_roi_shrink', STEREO_ROI_SHRINK_DEFAULT)
+        want_depth_samples = (self.args.range_est in ('depth', 'both', 'stereo')) or log_both or getattr(self, '_log_stereo_cmp', False)
+        want_stereo_samples = ((self.args.range_est in ('stereo', 'both')) or getattr(self, '_log_stereo_cmp', False) or log_both) and (depth_stereo_m is not None)
 
         if len(classIds) != 0:
             cx0 = IMG_W/2.0
@@ -1345,22 +1381,23 @@ class App:
                 H_real = OBJ_HEIGHT_M.get(name, OBJ_HEIGHT_M.get('traffic light') if is_tl_like else None)
                 s_pinhole = (FY_ * float(H_real)) / float(h) if (H_real is not None and h > 0) else None
 
-                if self.args.range_est in ('depth','both'):
-                    if (x1, y1, w, h) not in depth_cache_depth:
-                        depth_cache_depth[(x1, y1, w, h)] = median_depth_in_box(depth_m, (x1, y1, w, h), shrink=0.4)
-                    s_depth = depth_cache_depth[(x1, y1, w, h)]
-                else:
-                    s_depth = None
-                if (self.args.range_est == 'stereo') and (depth_stereo_m is not None):
-                    if (x1, y1, w, h) not in depth_cache_stereo:
-                        depth_cache_stereo[(x1, y1, w, h)] = median_depth_in_box(depth_stereo_m, (x1, y1, w, h), shrink=0.4)
-                    s_stereo = depth_cache_stereo[(x1, y1, w, h)]
-                else:
-                    s_stereo = None
+                s_depth = None
+                box_key = (x1, y1, w, h)
+                if want_depth_samples:
+                    if box_key not in depth_cache_depth:
+                        depth_cache_depth[box_key] = median_depth_in_box(depth_m, box_key, shrink=depth_roi)
+                    s_depth = depth_cache_depth[box_key]
+                s_stereo = None
+                if want_stereo_samples:
+                    if box_key not in depth_cache_stereo:
+                        depth_cache_stereo[box_key] = median_depth_in_box(depth_stereo_m, box_key, shrink=stereo_roi)
+                    s_stereo = depth_cache_stereo[box_key]
 
+                fusion_src = 'none'
                 if self.args.range_est == 'pinhole': s_use = s_pinhole
                 elif self.args.range_est == 'depth': s_use = s_depth
-                elif self.args.range_est == 'stereo': s_use = s_stereo
+                elif self.args.range_est == 'stereo':
+                    s_use, fusion_src = fuse_depth_sources(s_depth, s_stereo, h)
                 else: s_use = s_depth if (s_depth is not None) else s_pinhole
                 if s_use is None:
                     continue
@@ -1372,10 +1409,13 @@ class App:
 
                 lateral_ok = True
                 if do_gating:
+                    if self.args.range_est == 'stereo':
+                        lateral_range = s_use if s_use is not None else (s_depth if s_depth is not None else (s_pinhole if s_pinhole is not None else 0.0))
+                    else:
+                        lateral_range = s_pinhole if s_pinhole is not None else (s_depth if s_depth is not None else (s_stereo if s_stereo is not None else 0.0))
                     if abs(xc - cx0) > band_px_cls:
                         lateral_ok = False
                     else:
-                        lateral_range = s_pinhole if s_pinhole is not None else (s_depth if s_depth is not None else (s_stereo if s_stereo is not None else 0.0))
                         lateral = ((xc - cx0) / max(1e-6, FX_)) * max(1.0, lateral_range)
                         if abs(lateral) > lateral_max_m:
                             lateral_ok = False
@@ -1419,6 +1459,8 @@ class App:
                 if s_pinhole is not None: ann_parts.append(f"P:{s_pinhole:.1f}m")
                 if s_depth   is not None: ann_parts.append(f"D:{s_depth:.1f}m")
                 if s_stereo  is not None: ann_parts.append(f"S:{s_stereo:.1f}m")
+                if self.args.range_est == 'stereo' and s_use is not None and fusion_src in ('fused', 'min'):
+                    ann_parts.append(f"F:{s_use:.1f}m")
                 cv2.putText(bgr, f'{label} '+ ' '.join(ann_parts), (x1, max(20, y1-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                 if kind is not None and thr_for_kind is not None and nearest_thr is None:
@@ -1426,21 +1468,49 @@ class App:
 
                 # HUD points (for distance overlay window)
                 u, v_ = x1 + w/2.0, y1 + h/2.0
+                box_key = (x1, y1, w, h)
+                z = None
                 if self.args.range_est == 'stereo' and depth_stereo_m is not None:
-                    z = depth_cache_stereo.get((x1, y1, w, h))
-                else:
-                    z = depth_cache_depth.get((x1, y1, w, h))
+                    z = depth_cache_stereo.get(box_key)
+                    if z is None:
+                        z = median_depth_in_box(depth_stereo_m, box_key, shrink=stereo_roi)
                 if z is None:
-                    z = median_depth_in_box(depth_m if depth_stereo_m is None else (depth_stereo_m if self.args.range_est=='stereo' else depth_m),
-                                            (x1, y1, w, h), shrink=0.4)
+                    z = depth_cache_depth.get(box_key)
+                if z is None:
+                    z = median_depth_in_box(depth_m, box_key, shrink=depth_roi)
                 if z is not None:
                     xyz = pixel_to_camera(u, v_, z, FX_, FY_, CX_, CY_)
                     if xyz is not None:
                         det_points.append({'name': name, 'box': (x1, y1, w, h), 'xyz': xyz, 'z': z})
 
-                if log_both and csv_w is not None:
-                    if (s_pinhole is not None) and (s_depth is not None):
-                        csv_w.writerow([sim_time, name, x1, y1, w, h, s_pinhole, s_depth, abs(s_pinhole - s_depth), v, MU, None])
+                if getattr(self, '_log_both', False) and (getattr(self, '_csv_w', None) is not None):
+                    s_pin = s_pinhole if s_pinhole is not None else float('nan')
+                    s_dep = s_depth if s_depth is not None else float('nan')
+                    s_st = s_stereo if s_stereo is not None else float('nan')
+                    if s_pinhole is not None and s_depth is not None:
+                        abs_diff = abs(s_pinhole - s_depth)
+                    else:
+                        abs_diff = float('nan')
+                    sigma_val = getattr(self, '_sigma_depth_ema', None)
+                    sigma_out = float(sigma_val) if (sigma_val is not None and np.isfinite(sigma_val)) else float('nan')
+                    self._csv_w.writerow([
+                        sim_time, name, x1, y1, w, h,
+                        s_pin, s_dep, abs_diff,
+                        s_st, v, MU, sigma_out
+                    ])
+
+                if getattr(self, '_log_stereo_cmp', False) and (getattr(self, '_stereo_csv_w', None) is not None):
+                    stereo_val = s_stereo if s_stereo is not None else float('nan')
+                    depth_val = s_depth if s_depth is not None else float('nan')
+                    if s_stereo is not None and s_depth is not None:
+                        err_val = (s_stereo - s_depth)
+                    else:
+                        err_val = float('nan')
+                    pin_val = s_pinhole if s_pinhole is not None else float('nan')
+                    self._stereo_csv_w.writerow([
+                        sim_time, name, x1, y1, w, h,
+                        stereo_val, depth_val, err_val, pin_val, v, MU
+                    ])
 
         # Merge with CARLA TL actor state
         tl_state_actor = 'UNKNOWN'
@@ -1479,10 +1549,16 @@ class App:
         latency_s = max(DT, (ema_loop_ms + extra_ms)/1000.0) + 0.03
         sd = None
         try:
-            if (self.args.range_est in ('depth','both')) and (nearest_box is not None):
-                sd = depth_sigma_in_box(depth_m, nearest_box, shrink=0.3)
-            elif (self.args.range_est == 'stereo') and (nearest_box is not None) and (depth_stereo_m is not None):
-                sd = depth_sigma_in_box(depth_stereo_m, nearest_box, shrink=0.3)
+            if nearest_box is not None:
+                shrink_depth = getattr(self, 'depth_roi_shrink', 0.3)
+                shrink_stereo = getattr(self, 'stereo_roi_shrink', 0.3)
+                if self.args.range_est == 'stereo':
+                    if depth_stereo_m is not None:
+                        sd = depth_sigma_in_box(depth_stereo_m, nearest_box, shrink=shrink_stereo)
+                    if sd is None:
+                        sd = depth_sigma_in_box(depth_m, nearest_box, shrink=shrink_depth)
+                elif self.args.range_est in ('depth', 'both'):
+                    sd = depth_sigma_in_box(depth_m, nearest_box, shrink=shrink_depth)
         except Exception:
             sd = None
         if (sd is not None) and np.isfinite(sd): target = float(max(0.05, min(3.0, sd)))
@@ -1658,12 +1734,13 @@ class App:
 
     def run(self):
         csv_f = None; csv_w = None
-        log_both = (self.args.range_est == 'both' and self.args.compare_csv)
-        if log_both:
-            import csv
-            csv_f = open(self.args.compare_csv, 'w', newline='')
-            csv_w = csv.writer(csv_f)
-            csv_w.writerow(['t','cls','x','y','w','h','s_pinhole_m','s_depth_m','abs_diff_m','ego_v_mps','mu','sigma_depth'])
+        stereo_csv_f = None; stereo_csv_w = None
+        self._log_both = False
+        self._log_stereo_cmp = False
+        self._csv_w = None
+        self._stereo_csv_w = None
+        compare_csv_path = getattr(self.args, 'compare_csv', None)
+        stereo_compare_path = getattr(self.args, 'stereo_compare_csv', None)
 
         self._init_windows()
         clock = pygame.time.Clock()
@@ -1705,6 +1782,22 @@ class App:
         except Exception:
             pass
         self.args.range_est = used_range
+        log_both = bool(compare_csv_path) and self.args.range_est in ('both', 'stereo')
+        if log_both:
+            import csv
+            csv_f = open(compare_csv_path, 'w', newline='')
+            csv_w = csv.writer(csv_f)
+            csv_w.writerow(['t','cls','x','y','w','h','s_pinhole_m','s_depth_m','abs_diff_m','s_stereo_m','ego_v_mps','mu','sigma_depth'])
+            self._log_both = True
+            self._csv_w = csv_w
+        log_stereo_cmp = bool(stereo_compare_path) and self.args.range_est == 'stereo'
+        if log_stereo_cmp:
+            import csv
+            stereo_csv_f = open(stereo_compare_path, 'w', newline='')
+            stereo_csv_w = csv.writer(stereo_csv_f)
+            stereo_csv_w.writerow(['t','cls','x','y','w','h','s_stereo_m','s_depth_m','err_stereo_depth_m','s_pinhole_m','ego_v_mps','mu'])
+            self._log_stereo_cmp = True
+            self._stereo_csv_w = stereo_csv_w
         self.sensors = SensorRig(self.world.world, self.world.ego, used_range,
                                  enable_top=(not getattr(self.args, 'no_top_cam', False)),
                                  enable_depth=(not getattr(self.args, 'no_depth_cam', False)))
@@ -2052,7 +2145,13 @@ def parse_args():
                         choices=['pinhole', 'depth', 'stereo', 'both'],
                         help='Distance source: monocular pinhole, CARLA depth, stereo vision, or log both (depth vs pinhole)')
     parser.add_argument('--compare-csv', type=str, default=None,
-                        help='If set and --range-est=both, write comparisons to this CSV path')
+                        help='If set (range-est both/stereo), write pinhole/depth/stereo comparisons to this CSV path')
+    parser.add_argument('--stereo-compare-csv', type=str, default=None,
+                        help='If set and --range-est=stereo, write stereo vs depth comparisons to this CSV path')
+    parser.add_argument('--depth-roi-shrink', type=float, default=DEPTH_ROI_SHRINK_DEFAULT,
+                        help='ROI shrink factor (0..0.9) when sampling CARLA depth inside detection boxes')
+    parser.add_argument('--stereo-roi-shrink', type=float, default=STEREO_ROI_SHRINK_DEFAULT,
+                        help='ROI shrink factor (0..0.9) when sampling stereo disparity depth')
     # Visualization toggles
     parser.add_argument('--no-depth-viz', action='store_true',
                         help='Hide the DEPTH/HUD_DIST OpenCV windows (alias for --no-opencv)')
