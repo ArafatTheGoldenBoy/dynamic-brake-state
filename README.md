@@ -131,6 +131,28 @@ python dynamic_brake_state.py --preset fast --headless --no-opencv
     python results_analysis.py --telemetry-csv telem.csv --scenario-csv scenarios.csv --compare-csv ranges.csv --out-dir results --tag baseline
     ```
 
+- **Stereo range experiments**
+  - Example combined run using stereo range estimation with telemetry, scenario, and range comparison logging:
+
+    ```powershell
+    python dynamic_brake_state.py `
+      --stereo-cuda `
+      --range-est stereo `
+      --telemetry-csv telemetry_stereo.csv `
+      --scenario-csv scenarios_stereo.csv `
+      --compare-csv ranges_stereo.csv `
+      --stereo-compare-csv stereo_vs_depth.csv
+    ```
+
+  - Offline analysis of the stereo range comparison CSV:
+
+    ```powershell
+    python results_analysis.py `
+      --stereo-compare-csv ranges_stereo.csv `
+      --out-dir results_stereo `
+      --tag stereo
+    ```
+
 For more detailed experiment recipes and thesis‑style result suggestions, see `RESULTS.md`.
 
 ---
