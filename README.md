@@ -40,6 +40,7 @@ Core script: `dynamic_brake_state.py`
     - Full braking when the “gate” is hit.
     - Approach modulation when still outside the strict safety distance.
   - PI‑shaped brake control tracking desired deceleration.
+  - Lead obstacles are tracked with a constant-velocity Kalman filter + IoU gating so the same target persists across frames instead of reselecting the nearest detection each loop.
   - Hold states for `red_light`, `stop_sign`, and generic `obstacle` with:
     - Debounce / wait timers.
     - Throttle “kick” on release to overcome static friction.
@@ -50,7 +51,7 @@ Core script: `dynamic_brake_state.py`
   - Optional OpenCV windows:
     - `DEPTH` pseudo‑color view.
     - `HUD_DIST` text overlay with per‑object X/Y/Z in camera frame.
-  - Telemetry CSV logging (`--telemetry-csv`) with safety envelope terms, ABS slip stats, loop/detector timing, ground-truth headway, and false-stop flags.
+  - Telemetry CSV logging (`--telemetry-csv`) with safety envelope terms, ABS slip stats, loop/detector timing, measured sensor/control timestamps, actuation latency, Kalman-tracked headway, and false-stop flags.
   - Episode‑level scenario CSV logging (`--scenario-csv`) with initial headway (estimate + GT), min gap, stop time, collision flag, range/time margins, and ABS duty.
   - Range comparison CSV when `--range-est both` and `--compare-csv` are set.
   - Optional MP4 video recording (`--video-out`) of the front camera feed.
@@ -97,109 +98,169 @@ python dynamic_brake_state.py --preset fast --town Town10HD_Opt --npc-vehicles 1
 # Compare pinhole vs depth range estimates (logs to CSV)
 python dynamic_brake_state.py --range-est both --compare-csv ranges.csv --yolo-class-thr "traffic light:0.55, stop sign:0.45"
 
-# High quality run with telemetry logging
-python dynamic_brake_state.py --preset quality --telemetry-csv telem.csv --telemetry-hz 20
+# High quality run with telemetry logging + TTC/persistence tuning
+python dynamic_brake_state.py --preset quality --telemetry-csv telem.csv --telemetry-hz 20 \
+  --gate-confirm-frames 4 --ttc-confirm-s 2.0 --min-aeb-speed 4.0 \
+  --ttc-stage-strong 1.6 --ttc-stage-full 0.9 --aeb-stage-comfort 0.4 --aeb-stage-strong 0.7
 ```
 
-For non‑visual / CI‑style runs:
+For non-visual / CI-style runs:
 
 ```powershell
 python dynamic_brake_state.py --preset fast --headless --no-opencv
 ```
 
+If you need tighter or looser AEB sensitivity, tune:
+
+- `--min-aeb-speed` – minimum ego speed (m/s) required before automatic braking is allowed.
+- `--gate-confirm-frames` – consecutive frames that must hit the safety gate before braking starts.
+- `--ttc-confirm-s` – minimum (low) TTC duration that must persist before AEB is confirmed.
+- `--ttc-stage-strong` / `--ttc-stage-full` – TTC bands (s) for escalating from comfort → strong → full AEB.
+- `--aeb-stage-comfort` / `--aeb-stage-strong` – μg fractions per stage (full stage is fixed at 1.0).
+- `--aeb-ramp-up` / `--aeb-ramp-down` – rate limits (m/s² per second) on how quickly a_des can change.
+
+The controller now runs a three-stage AEB sequence (comfort → strong → full) where TTC thresholds decide when to escalate and
+`a_des` is ramped by the jerk caps above instead of instantly jumping to μg.
+
+These knobs feed into the hazard-confirm timer so the telemetry/scenario CSVs now include TTC and reaction-time metrics you can cite in a thesis.
+
 ---
 
 ## Experiments, Logging, and Analysis
 
-- **Telemetry & scenarios**
-  - Use `--telemetry-csv telem.csv` to log frame‑level data: speed, dynamic safety distance, time‑to‑collision surrogate, depth uncertainty, and brake command.
-  - Use `--scenario-csv scenarios.csv --scenario-tag my_scenario` to log episode‑level braking outcomes: initial speed/distance, minimum distance, stop time, and whether a collision occurred.
+### Thesis workflow at a glance
 
-- **Range estimation evaluation**
-  - Run with `--range-est both --compare-csv ranges.csv` to log pinhole vs depth distance estimates per detection.
-  - Analyze distance accuracy (MAE/RMSE, per‑class error, error vs. range) with the helper script `results_analysis.py`.
+1. **Start CARLA** in synchronous mode (`CarlaUE4.exe -quality-level=Epic`) and load the desired town.
+2. **Run `dynamic_brake_state.py`** with telemetry + scenario logging enabled (examples below). Keep YOLO weights in the repo root.
+3. **Collect CSVs**: telemetry (per frame), scenarios (per braking event), range comparisons (per detection), stereo-vs-depth (if stereo).
+4. **Post-process** all CSVs with `results_analysis.py` to generate plots/tables (`results_<tag>/...`).
+5. **Insert the figures/tables** (speed vs distance, TTC margins, slip histograms, false-stop counts, runtime histograms) directly into the Results chapter.
 
-- **Latency ablation**
-  - Use `--extra-latency-ms N` to inject additional perception/control latency into the safety envelope computation, emulating slower perception stacks.
-  - Compare braking performance across different `N` using telemetry and scenario CSVs.
+### Logged metrics (CSV columns)
 
-- **Offline analysis script**
-  - `results_analysis.py` now consumes telemetry/scenario/range CSVs and generates:
-    - Telemetry behaviour plots (`*_speed_gap.png`, `*_brake_slip.png`, `*_mu_est.png`, `*_tau_dyn.png`).
-    - μ-regime summary tables, time-to-stop pivot tables, and `*_range_margin_cdf.png` for the braking study.
-    - Loop/detector timing stats plus `*_loop_ms_hist.png` for real-time analysis.
-    - False-stop rates (per scenario and per frame) leveraging the new logging columns.
-  - Example:
+- **Telemetry (`--telemetry-csv`)**: `t`, `v_mps`, `tau_dyn`, `D_safety_dyn`, `sigma_depth`, `a_des`, `brake`, `lambda_max`, `abs_factor`, `mu_est`, `mu_regime`, `loop_ms`, `loop_ms_max`, `detect_ms`, `latency_ms`, `a_meas`, `x_rel_m`, `range_est_m`, `ttc_s`, `gate_hit`, `gate_confirmed`, `false_stop_flag`, `brake_stage`, `brake_stage_factor`, `tracker_s_m`, `tracker_rate_mps`, `lead_track_id`, `active_track_count`, `sensor_ts`, `control_ts`, `sensor_to_control_ms`, `actuation_ts`, `control_to_act_ms`, `sensor_to_act_ms`.
+- **Braking episodes (`--scenario-csv`)**: `scenario`, `trigger_kind`, `mu`, `v_init_mps`, `s_init_m`, `s_min_m`, `s_init_gt_m`, `s_min_gt_m`, `stopped`, `t_to_stop_s`, `collision`, `range_margin_m`, `tts_margin_s`, `ttc_init_s`, `ttc_min_s`, `reaction_time_s`, `max_lambda`, `mean_abs_factor`, `false_stop`.
+- **Range comparison (`--range-est both --compare-csv`)**: raw detections with pinhole vs depth distances plus per-class errors, μ, ego speed, and depth-uncertainty snapshots.
+- **Stereo comparison (`--stereo-compare-csv`)**: disparity-based vs depth-camera ground-truth to quantify stereo bias.
 
-    ```powershell
-    python results_analysis.py --telemetry-csv telem.csv --scenario-csv scenarios.csv --compare-csv ranges.csv --out-dir results --tag baseline
-    ```
+#### Measuring sensor-to-actuator latency
 
-- **Stereo range experiments**
-  - Example combined run using stereo range estimation with telemetry, scenario, and range comparison logging:
+Each telemetry row now carries the CARLA camera timestamp (`sensor_ts`), the time when the control command was issued (`control_ts`), and when the ego deceleration actually exceeded `0.8 m/s²` (`actuation_ts`).
 
-    ```powershell
-    python dynamic_brake_state.py `
-      --stereo-cuda `
-      --range-est stereo `
-      --telemetry-csv telemetry_stereo.csv `
-      --scenario-csv scenarios_stereo.csv `
-      --compare-csv ranges_stereo.csv `
-      --stereo-compare-csv stereo_vs_depth.csv
-    ```
+- `sensor_to_control_ms` represents the perception+planning delay from the camera frame to the brake command.
+- `control_to_act_ms` reports how long it took for the measured deceleration to respond after the brake command crossed 0.18 (roughly when the controller requests ABS-level braking).
+- `sensor_to_act_ms` is the combined end-to-end latency from camera exposure to measurable wheel/brake response.
 
-  - Offline analysis of the stereo range comparison CSV:
+These metrics let you build WCET vs. actuation latency histograms / ECDFs and discuss controller vs. actuator delays separately in the thesis.
 
-    ```powershell
-    python results_analysis.py `
-      --stereo-compare-csv ranges_stereo.csv `
-      --out-dir results_stereo `
-      --tag stereo
-    ```
+### Capturing runs for the thesis
 
-- **Lead vehicle stereo scenario (15 m/s)**
-  - Example CARLA run with a lead vehicle scenario at ~15 m/s, logging telemetry, scenarios, range comparisons, and stereo-vs-depth errors while spawning extra NPC traffic:
+```powershell
+# Baseline lead-vehicle study (telemetry + scenario + range)
+python dynamic_brake_state.py `
+  --preset fast `
+  --scenario-tag lead_vehicle_15mps `
+  --scenario-csv logs/scenarios_lead_vehicle_15mps.csv `
+  --telemetry-csv logs/telemetry_lead_vehicle_15mps.csv `
+  --range-est both `
+  --compare-csv logs/ranges_lead_vehicle_15mps.csv
 
-    ```powershell
-    python dynamic_brake_state.py `
-      --stereo-cuda `
-      --scenario-tag lead_vehicle_15mps1 `
-      --scenario-csv logs/scenarios_lead_vehicle_yolo12_stereo1.csv `
-      --telemetry-csv logs/telemetry_lead_vehicle_yolo12_stereo1.csv `
-      --range-est stereo `
-      --compare-csv logs/ranges_lead_vehicle_yolo12_stereo1.csv `
-      --stereo-compare-csv logs/stereo_vs_depth_lead_vehicle1.csv `
-      --log-interval-frames 10 `
-      --npc-vehicles 40
-    ```
+# Latency ablation (repeat for 0/25/50/100 ms)
+python dynamic_brake_state.py `
+  --preset fast `
+  --extra-latency-ms 50 `
+  --scenario-tag lead_vehicle_latency50 `
+  --scenario-csv logs/scenarios_latency50.csv `
+  --telemetry-csv logs/telemetry_latency50.csv
 
-  - Offline analysis for this lead-vehicle stereo run:
+# Stereo-focused experiment with CUDA SGM and TTC gating tuned for distance noise
+python dynamic_brake_state.py `
+  --range-est stereo `
+  --stereo-cuda `
+  --telemetry-csv logs/telemetry_stereo.csv `
+  --scenario-csv logs/scenarios_stereo.csv `
+  --compare-csv logs/ranges_stereo.csv `
+  --stereo-compare-csv logs/stereo_vs_depth.csv `
+  --gate-confirm-frames 5 `
+  --ttc-confirm-s 1.5
+```
 
-    ```powershell
-    python results_analysis.py `
-      --telemetry-csv logs/telemetry_lead_vehicle_yolo12_stereo1.csv `
-      --scenario-csv logs/scenarios_lead_vehicle_yolo12_stereo1.csv `
-      --compare-csv logs/ranges_lead_vehicle_yolo12_stereo1.csv `
-      --stereo-compare-csv logs/stereo_vs_depth_lead_vehicle1.csv `
-      --out-dir results_lead_vehicle `
-      --tag lead_vehicle
-    ```
+### Offline analysis script (`results_analysis.py`)
 
-For more detailed experiment recipes and thesis‑style result suggestions, see `RESULTS.md`.
+This helper turns CSVs into thesis-ready material:
 
-### ABS actuator experiments
+- Telemetry plots: `*_speed_gap.png`, `*_brake_slip.png`, `*_ttc.png`, `*_tau_dyn.png`.
+- Runtime and latency histograms (`*_loop_ms_hist.png`, `*_latency_ecdf.png`).
+- μ-regime summary tables, time-to-stop pivots, and reaction-time box plots (`*_reaction_box.png`).
+- Range-error violin/CDF plots and per-class MAE tables.
+- False-stop counts per trigger type using the new `false_stop_flag` columns.
 
-- `ABS_EXPERIMENTS.md` documents the complete workflow for the slip-based ABS actuator:
-  - Signal definitions, per-wheel PI control, and μ-adaptation strategy.
-  - Runtime commands for `--abs-mode off|fixed|adaptive`, telemetry/scenario logging, and HUD diagnostics.
-  - Surface/controller experiment grid, required metrics, and ready-to-fill tables for the thesis Results chapter.
-  - Offline analysis workflow (`results_analysis.py`) plus a publication-ready checklist.
+Example end-to-end analysis:
+
+```powershell
+python results_analysis.py `
+  --telemetry-csv logs/telemetry_lead_vehicle_15mps.csv `
+  --scenario-csv logs/scenarios_lead_vehicle_15mps.csv `
+  --compare-csv logs/ranges_lead_vehicle_15mps.csv `
+  --out-dir results_lead_vehicle `
+  --tag lead_vehicle
+```
+
+Repeat the command per scenario/tag; the script writes PNGs and CSV summary tables (mean TTC, braking margin, WCET stats) to the chosen `--out-dir`. Include those artifacts directly in the thesis.
+
+### Suggested thesis experiments
+
+| Study | Purpose | Recommended settings |
+| --- | --- | --- |
+| μ sweep | Demonstrate robustness to friction | Run `--mu 0.3/0.6/0.9` with `--apply-tire-friction`, keep scenario, compare `range_margin_m`, `collision`. |
+| Latency ablation | Show safety envelope expansion with added delay | Sweep `--extra-latency-ms` (0–100), plot `tau_dyn` and `t_to_stop_s` shifts. |
+| Range-estimator comparison | Quantify depth vs stereo vs pinhole | Use `--range-est both`, run `results_analysis.py` to produce per-class MAE; optionally repeat with `--range-est stereo` + `--stereo-compare-csv`. |
+| Detector runtime | Evaluate WCET / FPS | Collect `loop_ms`, `loop_ms_max`, `detect_ms` columns; report percentiles. |
+| False-stop auditing | Document failure cases | Use telemetry `false_stop_flag` and scenario `false_stop` columns; capture qualitative frames with `S`/`--video-out`. |
+| ABS/slip control | Compare `--abs-mode off|fixed|adaptive` | Log `lambda_max`, `abs_factor`, `mu_est`, plus `t_to_stop_s` from scenario CSVs. |
+
+### Tracking & latency terminology
+
+- **Kalman-based persistent tracking** – A multi-object tracker maintains several Kalman-filtered candidates (IDs + IoU/class association). `_control_step()` consumes the closest active track (distance + rate), so cut-ins or split detections no longer cause the brake target to flicker frame-to-frame; telemetry logs `lead_track_id` and `active_track_count` for each sample.
+- **Measured sensor-to-actuator delay** – Telemetry now logs the CARLA sensor timestamp, the control-command timestamp, and their difference (`sensor_to_control_ms`). That value captures the real pipeline latency (camera exposure → perception → control command) per frame, while the dynamic safety envelope still uses `latency_ms` as its conservative planning margin. For thesis claims, cite the measured columns and, if needed, compare them with the envelope’s safety margin.
+
+### ABS actuator experiments (summary)
+
+- Switch controller modes with `--abs-mode off|fixed|adaptive`; keep `--apply-tire-friction` enabled so CARLA tire friction matches the requested μ.
+- Telemetry columns `lambda_max`, `abs_factor`, and `mu_est` let you compute slip duty cycles and μ-regime transitions.
+- Recommended grid: μ = 0.9 / 0.6 / 0.3 (plus split-μ), speeds = 15 / 22 m/s, controllers = 3 modes → 12+ runs.
+- Use scenario CSVs to tabulate `t_to_stop_s`, `s_min_gt_m`, and collision flags. Pair plots with telemetry-derived jerk/slip charts from `results_analysis.py`.
+
+### Lead vehicle stereo example (ready to copy)
+
+```powershell
+python dynamic_brake_state.py `
+  --stereo-cuda `
+  --scenario-tag lead_vehicle_15mps1 `
+  --scenario-csv logs/scenarios_lead_vehicle_yolo12_stereo1.csv `
+  --telemetry-csv logs/telemetry_lead_vehicle_yolo12_stereo1.csv `
+  --range-est stereo `
+  --compare-csv logs/ranges_lead_vehicle_yolo12_stereo1.csv `
+  --stereo-compare-csv logs/stereo_vs_depth_lead_vehicle1.csv `
+  --log-interval-frames 10 `
+  --npc-vehicles 40
+
+python results_analysis.py `
+  --telemetry-csv logs/telemetry_lead_vehicle_yolo12_stereo1.csv `
+  --scenario-csv logs/scenarios_lead_vehicle_yolo12_stereo1.csv `
+  --compare-csv logs/ranges_lead_vehicle_yolo12_stereo1.csv `
+  --stereo-compare-csv logs/stereo_vs_depth_lead_vehicle1.csv `
+  --out-dir results_lead_vehicle `
+  --tag lead_vehicle
+```
+
+Drop the generated PNGs/tables into your paper along with frame grabs from `--video-out`.
 
 ---
 
 ## Thesis Usage
 
-In a research or thesis context, this project is used to quantitatively evaluate a dynamic safety‑envelope‑based braking controller under different sensing, friction, and latency conditions in CARLA. The simulator is configured to generate repeatable traffic scenarios with controlled ego speed, road friction, and obstacle placement. Each run logs frame‑level telemetry (vehicle speed, safety distance, τ, depth uncertainty, ABS slip metrics, ground-truth headway, loop/detector timing, and false-stop flags) plus episode-level outcomes (initial headway estimate + GT, minimum gap, stopping time, range/time margins, ABS duty, and collision/false-stop status) via `--telemetry-csv` and `--scenario-csv`. Additional experiments compare monocular, depth‑camera, and stereo range estimates via `--range-est both --compare-csv`, and emulate slower perception stacks using `--extra-latency-ms`. The accompanying `results_analysis.py` script turns these logs into telemetry plots, μ-regime tables, margin CDFs, runtime histograms, range-error charts, and false-stop summaries that can be dropped directly into the Results chapter.
+In a research or thesis context, this project is used to quantitatively evaluate a dynamic safety-envelope-based braking controller under different sensing, friction, and latency conditions in CARLA. The simulator is configured to generate repeatable traffic scenarios with controlled ego speed, road friction, and obstacle placement. Each run logs frame-level telemetry (vehicle speed, safety distance, τ, TTC, depth uncertainty, ABS slip metrics, ground-truth headway, loop/detector timing/WCET, and false-stop flags) plus episode-level outcomes (initial headway estimate + GT, minimum gap, stopping time, range/time/TTC margins, reaction time, ABS duty, and collision/false-stop status) via `--telemetry-csv` and `--scenario-csv`. Additional experiments compare monocular, depth-camera, and stereo range estimates via `--range-est both --compare-csv`, emulate slower perception stacks using `--extra-latency-ms`, and toggle slip control modes with `--abs-mode`. The accompanying `results_analysis.py` script turns these logs into telemetry plots, μ-regime tables, margin CDFs, runtime histograms, TTC box plots, range-error charts, and false-stop summaries that can be dropped directly into the Results chapter.
 
 ---
 
