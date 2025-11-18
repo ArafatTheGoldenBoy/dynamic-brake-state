@@ -40,6 +40,7 @@ Core script: `dynamic_brake_state.py`
     - Full braking when the “gate” is hit.
     - Approach modulation when still outside the strict safety distance.
   - PI‑shaped brake control tracking desired deceleration.
+  - Lead obstacles are tracked with a constant-velocity Kalman filter + IoU gating so the same target persists across frames instead of reselecting the nearest detection each loop.
   - Hold states for `red_light`, `stop_sign`, and generic `obstacle` with:
     - Debounce / wait timers.
     - Throttle “kick” on release to overcome static friction.
@@ -50,7 +51,7 @@ Core script: `dynamic_brake_state.py`
   - Optional OpenCV windows:
     - `DEPTH` pseudo‑color view.
     - `HUD_DIST` text overlay with per‑object X/Y/Z in camera frame.
-  - Telemetry CSV logging (`--telemetry-csv`) with safety envelope terms, ABS slip stats, loop/detector timing, ground-truth headway, and false-stop flags.
+  - Telemetry CSV logging (`--telemetry-csv`) with safety envelope terms, ABS slip stats, loop/detector timing, measured sensor/control timestamps, Kalman-tracked headway, and false-stop flags.
   - Episode‑level scenario CSV logging (`--scenario-csv`) with initial headway (estimate + GT), min gap, stop time, collision flag, range/time margins, and ABS duty.
   - Range comparison CSV when `--range-est both` and `--compare-csv` are set.
   - Optional MP4 video recording (`--video-out`) of the front camera feed.
@@ -130,7 +131,7 @@ These knobs feed into the hazard-confirm timer so the telemetry/scenario CSVs no
 
 ### Logged metrics (CSV columns)
 
-- **Telemetry (`--telemetry-csv`)**: `t`, `v_mps`, `tau_dyn`, `D_safety_dyn`, `sigma_depth`, `a_des`, `brake`, `lambda_max`, `abs_factor`, `mu_est`, `mu_regime`, `loop_ms`, `loop_ms_max`, `detect_ms`, `latency_ms`, `a_meas`, `x_rel_m`, `range_est_m`, `ttc_s`, `gate_hit`, `gate_confirmed`, `false_stop_flag`.
+- **Telemetry (`--telemetry-csv`)**: `t`, `v_mps`, `tau_dyn`, `D_safety_dyn`, `sigma_depth`, `a_des`, `brake`, `lambda_max`, `abs_factor`, `mu_est`, `mu_regime`, `loop_ms`, `loop_ms_max`, `detect_ms`, `latency_ms`, `a_meas`, `x_rel_m`, `range_est_m`, `ttc_s`, `gate_hit`, `gate_confirmed`, `false_stop_flag`, `tracker_s_m`, `tracker_rate_mps`, `sensor_ts`, `control_ts`, `sensor_to_control_ms`.
 - **Braking episodes (`--scenario-csv`)**: `scenario`, `trigger_kind`, `mu`, `v_init_mps`, `s_init_m`, `s_min_m`, `s_init_gt_m`, `s_min_gt_m`, `stopped`, `t_to_stop_s`, `collision`, `range_margin_m`, `tts_margin_s`, `ttc_init_s`, `ttc_min_s`, `reaction_time_s`, `max_lambda`, `mean_abs_factor`, `false_stop`.
 - **Range comparison (`--range-est both --compare-csv`)**: raw detections with pinhole vs depth distances plus per-class errors, μ, ego speed, and depth-uncertainty snapshots.
 - **Stereo comparison (`--stereo-compare-csv`)**: disparity-based vs depth-camera ground-truth to quantify stereo bias.
@@ -201,10 +202,10 @@ Repeat the command per scenario/tag; the script writes PNGs and CSV summary tabl
 | False-stop auditing | Document failure cases | Use telemetry `false_stop_flag` and scenario `false_stop` columns; capture qualitative frames with `S`/`--video-out`. |
 | ABS/slip control | Compare `--abs-mode off|fixed|adaptive` | Log `lambda_max`, `abs_factor`, `mu_est`, plus `t_to_stop_s` from scenario CSVs. |
 
-### Open items & terminology
+### Tracking & latency terminology
 
-- **Persistent object tracking** – `_control_step()` currently selects the obstacle that is nearest in the *current* frame and only smooths its distance via a single-pole EMA (`s_used = 0.7·last_s0 + 0.3·nearest_s_active`). There is no notion of a track ID, IoU-based association, or per-object life cycle, so the braking target can change whenever detections flicker. Closing this gap would involve keeping a persistent track (ID, distance, velocity) across frames and only switching to a new obstacle after multi-frame confirmation/hysteresis.
-- **True measured sensor-to-actuator delay** – `_safety_envelope()` derives `latency_s = max(DT, (ema_loop_ms + extra_ms)/1000.0) + 0.03`, which is an estimate based on observed loop timing plus a fixed pad. This number is logged in telemetry, but it is *not* a direct measurement of “camera frame timestamp minus brake command timestamp.” To publish true sensor-to-actuator latency you would need to record precise timestamps for (a) when CARLA delivers each sensor frame, (b) when the controller issues a non-zero brake command, and ideally (c) when the vehicle dynamics reflect that command, then log their differences. Until that instrumentation exists, describe the logged latency as an estimate, not an empirical measurement.
+- **Kalman-based persistent tracking** – Each loop feeds the nearest detection (distance + bounding box) into a single-target constant-velocity Kalman filter with IoU gating. The tracker persists through short occlusions (≤0.6 s) and only resets when a new object with low IoU/large range jump appears. `_control_step()` consumes the filtered distance/rate for TTC, meaning the braking target no longer flickers when YOLO jitters.
+- **Measured sensor-to-actuator delay** – Telemetry now logs the CARLA sensor timestamp, the control-command timestamp, and their difference (`sensor_to_control_ms`). That value captures the real pipeline latency (camera exposure → perception → control command) per frame, while the dynamic safety envelope still uses `latency_ms` as its conservative planning margin. For thesis claims, cite the measured columns and, if needed, compare them with the envelope’s safety margin.
 
 ### ABS actuator experiments (summary)
 

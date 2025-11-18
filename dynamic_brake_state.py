@@ -284,6 +284,129 @@ class AdaptivePISlipABSActuator(PISlipABSActuator):
             'regime': self.current_regime,
         }
 
+
+class LeadKalmanTracker:
+    """Single-target constant-velocity Kalman filter for lead obstacle distance."""
+
+    def __init__(self, dt: float,
+                 process_var: float = 8.0,
+                 meas_var: float = 4.0,
+                 max_miss_s: float = 0.6,
+                 reset_jump_m: float = 12.0,
+                 min_iou_keep: float = 0.15):
+        self.dt = dt
+        self.process_var = process_var
+        self.meas_var = meas_var
+        self.max_miss_s = max(0.0, max_miss_s)
+        self.reset_jump_m = reset_jump_m
+        self.min_iou_keep = min_iou_keep
+        self.reset()
+
+    def reset(self):
+        self.active = False
+        self.x = np.zeros((2, 1), dtype=float)
+        self.P = np.eye(2, dtype=float)
+        self.box: Optional[Tuple[int, int, int, int]] = None
+        self.kind: Optional[str] = None
+        self.state_time: Optional[float] = None
+        self.last_meas_time: Optional[float] = None
+
+    def deactivate(self):
+        self.reset()
+
+    def _predict_to(self, target_time: Optional[float]):
+        if not self.active:
+            self.state_time = target_time
+            return
+        if target_time is None:
+            return
+        if self.state_time is None:
+            self.state_time = target_time
+            return
+        dt = float(target_time) - float(self.state_time)
+        if not math.isfinite(dt):
+            return
+        if dt < 0.0:
+            self.state_time = target_time
+            return
+        if dt < 1e-6:
+            self.state_time = target_time
+            return
+        F = np.array([[1.0, dt], [0.0, 1.0]])
+        q = self.process_var
+        Q = np.array([[0.25 * dt**4, 0.5 * dt**3],
+                      [0.5 * dt**3, dt**2]], dtype=float) * q
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + Q
+        self.state_time = target_time
+
+    def _kalman_update(self, z: float):
+        H = np.array([[1.0, 0.0]])
+        R = np.array([[self.meas_var]])
+        z_vec = np.array([[z]])
+        y = z_vec - H @ self.x
+        S = H @ self.P @ H.T + R
+        if S.shape == (1, 1):
+            inv_S = 1.0 / float(S[0, 0]) if S[0, 0] != 0 else 0.0
+        else:
+            inv_S = np.linalg.pinv(S)
+        K = self.P @ H.T * inv_S
+        self.x = self.x + K @ y
+        I = np.eye(self.P.shape[0])
+        self.P = (I - K @ H) @ self.P
+
+    def step(self, sim_time: float,
+             measurement: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+        if measurement is not None:
+            dist = measurement.get('distance')
+            if dist is not None and math.isfinite(dist):
+                dist = float(dist)
+                meas_ts = measurement.get('timestamp')
+                if meas_ts is None or not math.isfinite(meas_ts):
+                    meas_ts = sim_time
+                box = measurement.get('box')
+                kind = measurement.get('kind')
+                if not self.active:
+                    self.active = True
+                    self.x = np.array([[dist], [0.0]], dtype=float)
+                    self.P = np.eye(2, dtype=float) * 5.0
+                    self.box = box
+                    self.kind = kind
+                    self.state_time = meas_ts
+                    self.last_meas_time = meas_ts
+                else:
+                    self._predict_to(meas_ts)
+                    pred_dist = float(self.x[0, 0])
+                    same_kind = (self.kind is None or kind is None or self.kind == kind)
+                    overlap = iou_xywh(self.box, box) if (self.box is not None and box is not None) else 0.0
+                    if (abs(dist - pred_dist) > self.reset_jump_m and overlap < self.min_iou_keep) or (not same_kind and overlap < self.min_iou_keep):
+                        self.x = np.array([[dist], [0.0]], dtype=float)
+                        self.P = np.eye(2, dtype=float) * 5.0
+                        self.box = box
+                        self.kind = kind
+                        self.state_time = meas_ts
+                        self.last_meas_time = meas_ts
+                    else:
+                        self._kalman_update(dist)
+                        self.box = box if box is not None else self.box
+                        self.kind = kind if kind is not None else self.kind
+                        self.last_meas_time = meas_ts
+                        self.state_time = meas_ts
+        if not self.active:
+            return None
+        if (self.last_meas_time is not None) and ((sim_time - self.last_meas_time) > self.max_miss_s):
+            self.reset()
+            return None
+        self._predict_to(sim_time)
+        if (self.last_meas_time is not None) and ((sim_time - self.last_meas_time) > self.max_miss_s):
+            self.reset()
+            return None
+        return {
+            'distance': float(self.x[0, 0]),
+            'rate': float(self.x[1, 0]),
+            'age': None if self.last_meas_time is None else float(sim_time - self.last_meas_time),
+        }
+
 # Detection (YOLO specific)
 YOLO_MODEL_PATH   = 'yolo12n.pt'     # path to YOLO12n weights
 CONF_THR_DEFAULT  = 0.45
@@ -1412,7 +1535,8 @@ class _TelemetryLogger:
             't','v_mps','tau_dyn','D_safety_dyn','sigma_depth','a_des','brake',
             'lambda_max','abs_factor','mu_est','mu_regime',
             'loop_ms','loop_ms_max','detect_ms','latency_ms','a_meas','x_rel_m','range_est_m',
-            'ttc_s','gate_hit','gate_confirmed','false_stop_flag'
+            'ttc_s','gate_hit','gate_confirmed','false_stop_flag',
+            'tracker_s_m','tracker_rate_mps','sensor_ts','control_ts','sensor_to_control_ms'
         ])
 
     def maybe_log(self, t: float, v: float, tau_dyn: Optional[float], D_safety_dyn: Optional[float],
@@ -1424,7 +1548,10 @@ class _TelemetryLogger:
                   a_meas: Optional[float], x_rel_m: Optional[float], range_est_m: Optional[float],
                   ttc_s: Optional[float],
                   gate_hit: Optional[bool], gate_confirmed: Optional[bool],
-                  false_stop_flag: Optional[bool]):
+                  false_stop_flag: Optional[bool],
+                  tracker_s: Optional[float], tracker_rate: Optional[float],
+                  sensor_ts: Optional[float], control_ts: Optional[float],
+                  sensor_to_control_ms: Optional[float]):
         if t - self._last_t >= self.period:
             self._last_t = t
             self._w.writerow([
@@ -1449,6 +1576,11 @@ class _TelemetryLogger:
                 (None if gate_hit is None else int(bool(gate_hit))),
                 (None if gate_confirmed is None else int(bool(gate_confirmed))),
                 (None if false_stop_flag is None else int(bool(false_stop_flag))),
+                (None if tracker_s is None else float(tracker_s)),
+                (None if tracker_rate is None else float(tracker_rate)),
+                (None if sensor_ts is None else float(sensor_ts)),
+                (None if control_ts is None else float(control_ts)),
+                (None if sensor_to_control_ms is None else float(sensor_to_control_ms)),
             ])
 
     def close(self):
@@ -1557,6 +1689,7 @@ class App:
             self.abs_actuator = PISlipABSActuator(dt=DT)
         else:
             self.abs_actuator = AdaptivePISlipABSActuator(dt=DT)
+        self._lead_tracker = LeadKalmanTracker(dt=DT)
         # Telemetry set up
         self.telemetry: Optional[_TelemetryLogger] = None
         if getattr(self.args, 'telemetry_csv', None):
@@ -2039,16 +2172,21 @@ class App:
         latency_s = None
         required_dist_physics = None
         gate_hit = False
-        if nearest_s_active is not None:
-            s_used = 0.7 * (last_s0 if last_s0 is not None else nearest_s_active) + 0.3 * nearest_s_active
+        tracked_rate = getattr(self, '_tracked_rate', None)
+        if (nearest_s_active is not None) or (last_s0 is not None):
+            s_used = last_s0 if last_s0 is not None else nearest_s_active
             tau_dyn, D_safety_dyn, sigma_depth, latency_s = self._safety_envelope(
                 v, MU, ema_loop_ms, nearest_box, nearest_conf, depth_m, depth_stereo_m)
             required_dist_physics = (v*v)/(2.0*max(1e-3, A_MU)) + v*tau_dyn + D_safety_dyn
             gate_hit = (required_dist_physics >= s_used)
 
         ttc = None
-        if s_used is not None and v > 0.05:
-            ttc = s_used / max(v, 0.1)
+        if s_used is not None:
+            closing_speed = v
+            if tracked_rate is not None and math.isfinite(tracked_rate) and tracked_rate < -0.05:
+                closing_speed = max(0.1, -tracked_rate)
+            closing_speed = max(0.1, closing_speed)
+            ttc = s_used / closing_speed
 
         in_brake_band = reason_object or reason_stop or reason_red
 
@@ -2095,9 +2233,10 @@ class App:
 
         in_brake_band = object_ready or reason_stop or reason_red
 
+        dbg_target = s_used if s_used is not None else nearest_s_active
         dbg = {'tau_dyn': tau_dyn, 'D_safety_dyn': D_safety_dyn, 'sigma_depth': sigma_depth, 'gate_hit': gate_hit,
                'a_des': None, 'brake': None, 'brake_active': in_brake_band,
-               'brake_reason': brake_reason, 'brake_target_dist': nearest_s_active,
+               'brake_reason': brake_reason, 'brake_target_dist': dbg_target,
                'latency_s': latency_s, 'ttc': ttc, 'gate_confirmed': gate_confirmed}
 
         if in_brake_band and (nearest_s_active is not None) and (tau_dyn is not None) and (D_safety_dyn is not None):
@@ -2129,7 +2268,7 @@ class App:
 
             dbg.update({'tau_dyn': tau_dyn, 'D_safety_dyn': D_safety_dyn, 'sigma_depth': sigma_depth,
                         'gate_hit': gate_hit, 'a_des': a_des, 'brake': brake,
-                        'brake_reason': brake_reason, 'brake_target_dist': nearest_s_active,
+                        'brake_reason': brake_reason, 'brake_target_dist': s_used if s_used is not None else nearest_s_active,
                         'latency_s': latency_s,
                         'ttc': ttc,
                         'gate_confirmed': gate_confirmed,
@@ -2149,6 +2288,8 @@ class App:
 
             if release:
                 hold_blocked = False; hold_reason = None; last_s0 = None
+                if hasattr(self, '_lead_tracker') and self._lead_tracker is not None:
+                    self._lead_tracker.deactivate()
                 throttle, brake = 0.0, 0.0
                 self._kick_until = self._sim_time + KICK_SEC
                 stop_release_ignore_until = self._sim_time + 2.0
@@ -2232,6 +2373,8 @@ class App:
 
         self._init_windows()
         clock = pygame.time.Clock()
+        if hasattr(self, '_lead_tracker') and self._lead_tracker is not None:
+            self._lead_tracker.reset()
 
         self.world = WorldManager(
             self.args.host, self.args.port, self.args.town, self.args.mu, self.args.apply_tire_friction,
@@ -2307,8 +2450,10 @@ class App:
         hold_blocked = False
         hold_reason   = None
         last_s0 = None
+        tracked_rate = None
         prev_loc = None
         sim_time = 0.0
+        sensor_timestamp = None
         kick_until = 0.0
         stop_latch_time = -1.0
         stop_armed = False
@@ -2362,6 +2507,10 @@ class App:
                 tic = time.time()
 
                 frames = self.sensors.read(expected_frame=frame_id)
+                sensor_timestamp = None
+                front_frame = frames.get('front')
+                if front_frame is not None:
+                    sensor_timestamp = getattr(front_frame, 'timestamp', None)
                 io = self._read_frames(frames)
                 bgr = io['bgr']
                 img_top = io['img_top']
@@ -2472,15 +2621,38 @@ class App:
                 else:
                     red_green_since = -1.0
 
+                tracker_state = None
+                tracked_distance_for_control = None
+                tracked_rate = None
+                tracker = getattr(self, '_lead_tracker', None)
+                if tracker is not None:
+                    measurement_payload = None
+                    if nearest_s_active is not None:
+                        measurement_payload = {
+                            'distance': nearest_s_active,
+                            'box': nearest_box,
+                            'kind': nearest_kind,
+                            'timestamp': sensor_timestamp,
+                        }
+                    tracker_state = tracker.step(sim_time, measurement_payload)
+                    if tracker_state is not None:
+                        tracked_distance_for_control = tracker_state.get('distance')
+                        tracked_rate = tracker_state.get('rate')
+                if tracked_distance_for_control is None:
+                    if nearest_s_active is not None:
+                        tracked_distance_for_control = nearest_s_active
+                    else:
+                        tracked_distance_for_control = last_s0
+                self._tracked_distance = tracked_distance_for_control
+                self._tracked_rate = tracked_rate
+
                 trigger_name = nearest_kind
-                if nearest_s_active is not None:
-                    last_s0 = nearest_s_active
 
                 # Control step via helper
                 throttle, brake, ctrl, hold_blocked, hold_reason, stop_armed, stop_latch_time, stop_release_ignore_until, dbg_map, I_err = \
                     self._control_step(trigger_name, nearest_s_active, nearest_thr,
                                        tl_state, tl_s_active, v, v_target, MU, ema_loop_ms,
-                                       last_s0, stop_armed, stop_latch_time, stop_release_ignore_until,
+                                       tracked_distance_for_control, stop_armed, stop_latch_time, stop_release_ignore_until,
                                        red_green_since, no_trigger_elapsed, no_red_elapsed,
                                        depth_m, depth_stereo_m, nearest_box, nearest_conf,
                                        I_err, v_prev)
@@ -2522,6 +2694,12 @@ class App:
                 brake_target = dbg_map.get('brake_target_dist')
                 dbg_latency_s = dbg_map.get('latency_s')
                 dbg_latency_ms = None if (dbg_latency_s is None) else (float(dbg_latency_s) * 1000.0)
+                if tracker_state is not None and tracker_state.get('distance') is not None:
+                    last_s0 = tracker_state.get('distance')
+                elif tracked_distance_for_control is not None:
+                    last_s0 = tracked_distance_for_control
+                else:
+                    last_s0 = None
                 if (not brake_reason) and hold_blocked and hold_reason in ('stop_sign','red_light','obstacle'):
                     brake_reason = hold_reason
                 hazard_since_prev = getattr(self, '_hazard_confirm_since', -1.0)
@@ -2561,6 +2739,13 @@ class App:
                                     false_stop_flag = True
                 else:
                     false_stop_flag = False
+
+                tracker_distance_logged = tracker_state.get('distance') if tracker_state is not None else None
+                tracker_rate_logged = tracked_rate
+                control_timestamp = sim_time
+                sensor_to_control_ms = None
+                if sensor_timestamp is not None and math.isfinite(sensor_timestamp):
+                    sensor_to_control_ms = max(0.0, (control_timestamp - float(sensor_timestamp)) * 1000.0)
 
                 # --- Episode bookkeeping: start/end of braking events ---
                 reason_allowed = brake_reason in ('obstacle','stop_sign','red_light')
@@ -2810,7 +2995,10 @@ class App:
                                                  a_long, x_rel_gt, range_est,
                                                  dbg_ttc,
                                                  dbg_gate_hit, dbg_gate_confirmed,
-                                                 false_stop_flag)
+                                                 false_stop_flag,
+                                                 tracker_distance_logged, tracker_rate_logged,
+                                                 sensor_timestamp, control_timestamp,
+                                                 sensor_to_control_ms)
                     except Exception:
                         pass
                 clock.tick(int(1.0/DT))
