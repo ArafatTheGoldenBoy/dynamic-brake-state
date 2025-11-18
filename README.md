@@ -51,7 +51,7 @@ Core script: `dynamic_brake_state.py`
   - Optional OpenCV windows:
     - `DEPTH` pseudo‑color view.
     - `HUD_DIST` text overlay with per‑object X/Y/Z in camera frame.
-  - Telemetry CSV logging (`--telemetry-csv`) with safety envelope terms, ABS slip stats, loop/detector timing, measured sensor/control timestamps, Kalman-tracked headway, and false-stop flags.
+  - Telemetry CSV logging (`--telemetry-csv`) with safety envelope terms, ABS slip stats, loop/detector timing, measured sensor/control timestamps, actuation latency, Kalman-tracked headway, and false-stop flags.
   - Episode‑level scenario CSV logging (`--scenario-csv`) with initial headway (estimate + GT), min gap, stop time, collision flag, range/time margins, and ABS duty.
   - Range comparison CSV when `--range-est both` and `--compare-csv` are set.
   - Optional MP4 video recording (`--video-out`) of the front camera feed.
@@ -131,10 +131,20 @@ These knobs feed into the hazard-confirm timer so the telemetry/scenario CSVs no
 
 ### Logged metrics (CSV columns)
 
-- **Telemetry (`--telemetry-csv`)**: `t`, `v_mps`, `tau_dyn`, `D_safety_dyn`, `sigma_depth`, `a_des`, `brake`, `lambda_max`, `abs_factor`, `mu_est`, `mu_regime`, `loop_ms`, `loop_ms_max`, `detect_ms`, `latency_ms`, `a_meas`, `x_rel_m`, `range_est_m`, `ttc_s`, `gate_hit`, `gate_confirmed`, `false_stop_flag`, `tracker_s_m`, `tracker_rate_mps`, `lead_track_id`, `active_track_count`, `sensor_ts`, `control_ts`, `sensor_to_control_ms`.
+- **Telemetry (`--telemetry-csv`)**: `t`, `v_mps`, `tau_dyn`, `D_safety_dyn`, `sigma_depth`, `a_des`, `brake`, `lambda_max`, `abs_factor`, `mu_est`, `mu_regime`, `loop_ms`, `loop_ms_max`, `detect_ms`, `latency_ms`, `a_meas`, `x_rel_m`, `range_est_m`, `ttc_s`, `gate_hit`, `gate_confirmed`, `false_stop_flag`, `tracker_s_m`, `tracker_rate_mps`, `lead_track_id`, `active_track_count`, `sensor_ts`, `control_ts`, `sensor_to_control_ms`, `actuation_ts`, `control_to_act_ms`, `sensor_to_act_ms`.
 - **Braking episodes (`--scenario-csv`)**: `scenario`, `trigger_kind`, `mu`, `v_init_mps`, `s_init_m`, `s_min_m`, `s_init_gt_m`, `s_min_gt_m`, `stopped`, `t_to_stop_s`, `collision`, `range_margin_m`, `tts_margin_s`, `ttc_init_s`, `ttc_min_s`, `reaction_time_s`, `max_lambda`, `mean_abs_factor`, `false_stop`.
 - **Range comparison (`--range-est both --compare-csv`)**: raw detections with pinhole vs depth distances plus per-class errors, μ, ego speed, and depth-uncertainty snapshots.
 - **Stereo comparison (`--stereo-compare-csv`)**: disparity-based vs depth-camera ground-truth to quantify stereo bias.
+
+#### Measuring sensor-to-actuator latency
+
+Each telemetry row now carries the CARLA camera timestamp (`sensor_ts`), the time when the control command was issued (`control_ts`), and when the ego deceleration actually exceeded `0.8 m/s²` (`actuation_ts`).
+
+- `sensor_to_control_ms` represents the perception+planning delay from the camera frame to the brake command.
+- `control_to_act_ms` reports how long it took for the measured deceleration to respond after the brake command crossed 0.18 (roughly when the controller requests ABS-level braking).
+- `sensor_to_act_ms` is the combined end-to-end latency from camera exposure to measurable wheel/brake response.
+
+These metrics let you build WCET vs. actuation latency histograms / ECDFs and discuss controller vs. actuator delays separately in the thesis.
 
 ### Capturing runs for the thesis
 

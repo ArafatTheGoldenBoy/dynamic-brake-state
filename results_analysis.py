@@ -14,8 +14,9 @@ def load_telemetry(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     numeric_cols = [
         "t", "v_mps", "tau_dyn", "D_safety_dyn", "sigma_depth", "a_des", "brake",
-        "lambda_max", "abs_factor", "mu_est", "loop_ms", "detect_ms",
-        "latency_ms", "a_meas", "x_rel_m", "range_est_m", "gate_hit", "false_stop_flag"
+        "lambda_max", "abs_factor", "mu_est", "loop_ms", "loop_ms_max", "detect_ms",
+        "latency_ms", "a_meas", "x_rel_m", "range_est_m", "gate_hit", "false_stop_flag",
+        "ttc_s", "sensor_to_control_ms", "control_to_act_ms", "sensor_to_act_ms"
     ]
     for col in numeric_cols:
         if col in df.columns:

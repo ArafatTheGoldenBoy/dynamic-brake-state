@@ -108,6 +108,11 @@ FRICTION_CONFIGS = {
 FALSE_STOP_MARGIN_M = 5.0      # if actual gap exceeds safety distance by this margin while braking → suspicious
 FALSE_STOP_TTC_S    = 4.0      # TTC above this while brake engaged → likely false stop
 
+# Actuation-latency measurement thresholds
+ACTUATION_BRAKE_CMD_MIN   = 0.18   # require brake command above this before timing
+ACTUATION_DECEL_THRESH    = 0.8    # m/s^2 decel magnitude that counts as "brake is biting"
+ACTUATION_TIMEOUT_S       = 1.5    # give up if no response within this horizon
+
 
 def compute_slip_per_wheel(v_ego: float, wheel_speeds: List[float]) -> List[float]:
     """Return longitudinal slip λ for each wheel in [0, 1]."""
@@ -1675,7 +1680,8 @@ class _TelemetryLogger:
             'loop_ms','loop_ms_max','detect_ms','latency_ms','a_meas','x_rel_m','range_est_m',
             'ttc_s','gate_hit','gate_confirmed','false_stop_flag',
             'tracker_s_m','tracker_rate_mps','lead_track_id','active_track_count',
-            'sensor_ts','control_ts','sensor_to_control_ms'
+            'sensor_ts','control_ts','sensor_to_control_ms',
+            'actuation_ts','control_to_act_ms','sensor_to_act_ms'
         ])
 
     def maybe_log(self, t: float, v: float, tau_dyn: Optional[float], D_safety_dyn: Optional[float],
@@ -1691,7 +1697,10 @@ class _TelemetryLogger:
                   tracker_s: Optional[float], tracker_rate: Optional[float],
                   tracker_id: Optional[int], tracker_count: Optional[int],
                   sensor_ts: Optional[float], control_ts: Optional[float],
-                  sensor_to_control_ms: Optional[float]):
+                  sensor_to_control_ms: Optional[float],
+                  actuation_ts: Optional[float],
+                  control_to_act_ms: Optional[float],
+                  sensor_to_act_ms: Optional[float]):
         if t - self._last_t >= self.period:
             self._last_t = t
             self._w.writerow([
@@ -1723,6 +1732,9 @@ class _TelemetryLogger:
                 (None if sensor_ts is None else float(sensor_ts)),
                 (None if control_ts is None else float(control_ts)),
                 (None if sensor_to_control_ms is None else float(sensor_to_control_ms)),
+                (None if actuation_ts is None else float(actuation_ts)),
+                (None if control_to_act_ms is None else float(control_to_act_ms)),
+                (None if sensor_to_act_ms is None else float(sensor_to_act_ms)),
             ])
 
     def close(self):
@@ -2625,6 +2637,13 @@ class App:
         dbg_a_des = None
         dbg_brake = None
 
+        # Latency measurement states
+        pending_actuation: Optional[Dict[str, float]] = None
+        last_actuation_ts: Optional[float] = None
+        last_control_to_act_ms: Optional[float] = None
+        last_sensor_to_act_ms: Optional[float] = None
+        prev_brake_cmd = 0.0
+
         # Braking episode tracking for scenario-level results
         episode_active = False
         episode_trigger = None
@@ -2687,6 +2706,22 @@ class App:
                 if v < 0.05: v = 0.0
                 wheel_speeds = self._get_wheel_linear_speeds()
                 a_long = 0.0 if v_prev is None else (v - v_prev) / DT
+
+                # Check if a pending actuation measurement can be resolved
+                if pending_actuation is not None:
+                    control_ts = pending_actuation.get('control_ts', sim_time)
+                    since_control = sim_time - float(control_ts)
+                    if since_control > ACTUATION_TIMEOUT_S:
+                        pending_actuation = None
+                    elif a_long <= -ACTUATION_DECEL_THRESH:
+                        last_actuation_ts = sim_time
+                        last_control_to_act_ms = max(0.0, since_control * 1000.0)
+                        sensor_ts_pending = pending_actuation.get('sensor_ts')
+                        if sensor_ts_pending is not None and math.isfinite(sensor_ts_pending):
+                            last_sensor_to_act_ms = max(0.0, (sim_time - float(sensor_ts_pending)) * 1000.0)
+                        else:
+                            last_sensor_to_act_ms = None
+                        pending_actuation = None
 
                 if not getattr(self.args, 'no_opencv', False) and not self.headless:
                     max_vis = 120.0
@@ -2820,6 +2855,20 @@ class App:
                         abs_factor = abs_dbg.get('f_global')
                         abs_mu = abs_dbg.get('mu_est')
                         abs_regime = abs_dbg.get('regime')
+
+                # If a new brake command crosses the threshold, start measuring actuation latency
+                brake_cmd_for_latency = float(brake)
+                if (brake_cmd_for_latency >= ACTUATION_BRAKE_CMD_MIN and
+                        prev_brake_cmd < ACTUATION_BRAKE_CMD_MIN):
+                    pending_actuation = {
+                        'sensor_ts': sensor_timestamp if (sensor_timestamp is not None and math.isfinite(sensor_timestamp)) else sim_time,
+                        'control_ts': sim_time,
+                        'cmd_brake': brake_cmd_for_latency,
+                    }
+                elif brake_cmd_for_latency < (0.5 * ACTUATION_BRAKE_CMD_MIN):
+                    pending_actuation = None
+                prev_brake_cmd = brake_cmd_for_latency
+
                 dbg_map['brake'] = brake
                 dbg_map['abs_lambda_max'] = abs_lambda
                 dbg_map['abs_factor'] = abs_factor
@@ -3149,7 +3198,9 @@ class App:
                                                  tracker_distance_logged, tracker_rate_logged,
                                                  tracker_id_logged, tracker_count_logged,
                                                  sensor_timestamp, control_timestamp,
-                                                 sensor_to_control_ms)
+                                                 sensor_to_control_ms,
+                                                 last_actuation_ts, last_control_to_act_ms,
+                                                 last_sensor_to_act_ms)
                     except Exception:
                         pass
                 clock.tick(int(1.0/DT))
