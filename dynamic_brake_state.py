@@ -61,6 +61,9 @@ S_ENGAGE          = 80.0              # generic engage for vehicles/unknown
 S_ENGAGE_TL       = 55.0              # traffic‑light engage distance (red)
 S_ENGAGE_PED      = 45.0              # pedestrian engage distance
 V_STOP            = 0.10
+V_AEB_MIN_DEFAULT = 2.5               # minimum speed for obstacle-triggered AEB
+GATE_CONFIRM_FRAMES_DEFAULT = 3       # frames of gate_hit before AEB entry
+TTC_CONFIRM_S_DEFAULT = 2.5           # TTC threshold for obstacle confirmation
 
 # Clear timers (per reason)
 CLEAR_DELAY_OBS   = 0.9               # obstacle clear debounce
@@ -1408,17 +1411,20 @@ class _TelemetryLogger:
         self._w.writerow([
             't','v_mps','tau_dyn','D_safety_dyn','sigma_depth','a_des','brake',
             'lambda_max','abs_factor','mu_est','mu_regime',
-            'loop_ms','detect_ms','latency_ms','a_meas','x_rel_m','range_est_m',
-            'gate_hit','false_stop_flag'
+            'loop_ms','loop_ms_max','detect_ms','latency_ms','a_meas','x_rel_m','range_est_m',
+            'ttc_s','gate_hit','gate_confirmed','false_stop_flag'
         ])
 
     def maybe_log(self, t: float, v: float, tau_dyn: Optional[float], D_safety_dyn: Optional[float],
                   sigma_depth: Optional[float], a_des: Optional[float], brake: Optional[float],
                   lambda_max: Optional[float], abs_factor: Optional[float],
                   mu_est: Optional[float], mu_regime: Optional[str],
-                  loop_ms: Optional[float], detect_ms: Optional[float], latency_ms: Optional[float],
+                  loop_ms: Optional[float], loop_ms_max: Optional[float],
+                  detect_ms: Optional[float], latency_ms: Optional[float],
                   a_meas: Optional[float], x_rel_m: Optional[float], range_est_m: Optional[float],
-                  gate_hit: Optional[bool], false_stop_flag: Optional[bool]):
+                  ttc_s: Optional[float],
+                  gate_hit: Optional[bool], gate_confirmed: Optional[bool],
+                  false_stop_flag: Optional[bool]):
         if t - self._last_t >= self.period:
             self._last_t = t
             self._w.writerow([
@@ -1433,12 +1439,15 @@ class _TelemetryLogger:
                 (None if mu_est is None else float(mu_est)),
                 mu_regime,
                 (None if loop_ms is None else float(loop_ms)),
+                (None if loop_ms_max is None else float(loop_ms_max)),
                 (None if detect_ms is None else float(detect_ms)),
                 (None if latency_ms is None else float(latency_ms)),
                 (None if a_meas is None else float(a_meas)),
                 (None if x_rel_m is None else float(x_rel_m)),
                 (None if range_est_m is None else float(range_est_m)),
+                (None if ttc_s is None else float(ttc_s)),
                 (None if gate_hit is None else int(bool(gate_hit))),
+                (None if gate_confirmed is None else int(bool(gate_confirmed))),
                 (None if false_stop_flag is None else int(bool(false_stop_flag))),
             ])
 
@@ -1467,6 +1476,7 @@ class _ScenarioLogger:
             's_init_gt_m', 's_min_gt_m',
             'stopped', 't_to_stop_s', 'collision',
             'range_margin_m', 'tts_margin_s',
+            'ttc_init_s', 'ttc_min_s', 'reaction_time_s',
             'max_lambda', 'mean_abs_factor', 'false_stop'
         ])
         self._f.flush()
@@ -1476,6 +1486,8 @@ class _ScenarioLogger:
             s_init_gt: Optional[float], s_min_gt: Optional[float],
             stopped: bool, t_to_stop: float, collision: bool,
             range_margin: Optional[float], tts_margin: Optional[float],
+            ttc_init: Optional[float], ttc_min: Optional[float],
+            reaction_time: Optional[float],
             max_lambda: Optional[float], mean_abs_factor: Optional[float],
             false_stop: bool):
         self._w.writerow([
@@ -1492,6 +1504,9 @@ class _ScenarioLogger:
             bool(collision),
             (None if range_margin is None else float(range_margin)),
             (None if tts_margin is None else float(tts_margin)),
+            (None if ttc_init is None else float(ttc_init)),
+            (None if ttc_min is None else float(ttc_min)),
+            (None if reaction_time is None else float(reaction_time)),
             (None if max_lambda is None else float(max_lambda)),
             (None if mean_abs_factor is None else float(mean_abs_factor)),
             bool(false_stop),
@@ -1576,6 +1591,23 @@ class App:
             self.stereo_roi_shrink = max(0.0, min(0.9, float(getattr(self.args, 'stereo_roi_shrink', STEREO_ROI_SHRINK_DEFAULT))))
         except Exception:
             self.stereo_roi_shrink = STEREO_ROI_SHRINK_DEFAULT
+
+        # Decision-layer tuning knobs
+        try:
+            self.min_aeb_speed = max(0.0, float(getattr(self.args, 'min_aeb_speed', V_AEB_MIN_DEFAULT)))
+        except Exception:
+            self.min_aeb_speed = V_AEB_MIN_DEFAULT
+        try:
+            self.gate_confirm_frames = max(1, int(getattr(self.args, 'gate_confirm_frames', GATE_CONFIRM_FRAMES_DEFAULT)))
+        except Exception:
+            self.gate_confirm_frames = GATE_CONFIRM_FRAMES_DEFAULT
+        try:
+            self.ttc_confirm_s = max(0.5, float(getattr(self.args, 'ttc_confirm_s', TTC_CONFIRM_S_DEFAULT)))
+        except Exception:
+            self.ttc_confirm_s = TTC_CONFIRM_S_DEFAULT
+
+        self._gate_confirm_counter = 0
+        self._hazard_confirm_since = -1.0
 
     def _draw_hud(self, screen, bgr, img_top, perf_fps, perf_ms, x, y, z, yaw, compass,
                    frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
@@ -1999,6 +2031,25 @@ class App:
             reason_red = True
             nearest_s_active = tl_s_active
 
+        # Pre-compute dynamic envelope + gate state if we have a candidate distance
+        s_used = None
+        tau_dyn = None
+        D_safety_dyn = None
+        sigma_depth = None
+        latency_s = None
+        required_dist_physics = None
+        gate_hit = False
+        if nearest_s_active is not None:
+            s_used = 0.7 * (last_s0 if last_s0 is not None else nearest_s_active) + 0.3 * nearest_s_active
+            tau_dyn, D_safety_dyn, sigma_depth, latency_s = self._safety_envelope(
+                v, MU, ema_loop_ms, nearest_box, nearest_conf, depth_m, depth_stereo_m)
+            required_dist_physics = (v*v)/(2.0*max(1e-3, A_MU)) + v*tau_dyn + D_safety_dyn
+            gate_hit = (required_dist_physics >= s_used)
+
+        ttc = None
+        if s_used is not None and v > 0.05:
+            ttc = s_used / max(v, 0.1)
+
         in_brake_band = reason_object or reason_stop or reason_red
 
         brake_reason = None
@@ -2026,17 +2077,30 @@ class App:
         if in_brake_band and trigger_name and ('stop sign' in trigger_name) and (stop_release_ignore_until >= 0) and (self._sim_time < stop_release_ignore_until):
             in_brake_band = False
 
-        dbg = {'tau_dyn': None, 'D_safety_dyn': None, 'sigma_depth': None, 'gate_hit': False,
+        gate_confirmed = gate_hit
+        object_ready = reason_object
+        if reason_object:
+            if gate_hit:
+                self._gate_confirm_counter = min(self._gate_confirm_counter + 1, self.gate_confirm_frames * 2)
+            else:
+                self._gate_confirm_counter = max(0, self._gate_confirm_counter - 1)
+            gate_confirmed = self._gate_confirm_counter >= self.gate_confirm_frames
+            ttc_ok = (ttc is None) or (ttc <= self.ttc_confirm_s)
+            speed_ok = v >= self.min_aeb_speed
+            object_ready = gate_confirmed and ttc_ok and speed_ok
+        else:
+            self._gate_confirm_counter = 0
+            gate_confirmed = False
+            object_ready = False
+
+        in_brake_band = object_ready or reason_stop or reason_red
+
+        dbg = {'tau_dyn': tau_dyn, 'D_safety_dyn': D_safety_dyn, 'sigma_depth': sigma_depth, 'gate_hit': gate_hit,
                'a_des': None, 'brake': None, 'brake_active': in_brake_band,
                'brake_reason': brake_reason, 'brake_target_dist': nearest_s_active,
-               'latency_s': None}
+               'latency_s': latency_s, 'ttc': ttc, 'gate_confirmed': gate_confirmed}
 
-        if in_brake_band and (nearest_s_active is not None):
-            s_used = 0.7 * (last_s0 if last_s0 is not None else nearest_s_active) + 0.3 * nearest_s_active
-            tau_dyn, D_safety_dyn, sigma_depth, latency_s = self._safety_envelope(v, MU, ema_loop_ms, nearest_box, nearest_conf, depth_m, depth_stereo_m)
-            required_dist_physics = (v*v)/(2.0*max(1e-3, A_MU)) + v*tau_dyn + D_safety_dyn
-            gate_hit = (required_dist_physics >= s_used)
-
+        if in_brake_band and (nearest_s_active is not None) and (tau_dyn is not None) and (D_safety_dyn is not None):
             if gate_hit:
                 a_des = A_MU
                 brake_ff = min(1.0, a_des / A_MAX)
@@ -2067,6 +2131,8 @@ class App:
                         'gate_hit': gate_hit, 'a_des': a_des, 'brake': brake,
                         'brake_reason': brake_reason, 'brake_target_dist': nearest_s_active,
                         'latency_s': latency_s,
+                        'ttc': ttc,
+                        'gate_confirmed': gate_confirmed,
                         'brake_active': True})
 
         elif hold_blocked:
@@ -2234,7 +2300,7 @@ class App:
         dist_total = 0.0
         perf_ms = 0.0; perf_fps = 0.0; ema_loop_ms = DT * 1000.0
         v_prev = None; I_err = 0.0
-        gate_hit_ema = 0.0
+        loop_ms_max = 0.0
         sigma_depth_ema = 0.40
         sigma_depth_max_step = 0.50
         stop_persist_count = 0
@@ -2275,12 +2341,17 @@ class App:
         episode_abs_factor_count = 0
         episode_false_flag = False
         episode_t_start = 0.0
+        episode_ttc_init = None
+        episode_ttc_min = None
+        episode_reaction_time = None
         if not hasattr(self, '_prev_brake_activation'):
             self._prev_brake_activation = False
         if not hasattr(self, '_collision_logged_count'):
             self._collision_logged_count = 0
         collision_event_time = getattr(self, '_collision_last_time', -1.0)
         collision_logged_count = getattr(self, '_collision_logged_count', 0)
+        self._gate_confirm_counter = 0
+        self._hazard_confirm_since = -1.0
 
         try:
             t0 = time.time()
@@ -2438,8 +2509,10 @@ class App:
                 dbg_D_safety_dyn = dbg_map.get('D_safety_dyn')
                 dbg_sigma_depth = dbg_map.get('sigma_depth')
                 dbg_gate_hit = dbg_map.get('gate_hit')
+                dbg_gate_confirmed = dbg_map.get('gate_confirmed')
                 dbg_a_des = dbg_map.get('a_des')
                 dbg_brake = dbg_map.get('brake')
+                dbg_ttc = dbg_map.get('ttc')
                 dbg_abs_lambda = dbg_map.get('abs_lambda_max')
                 dbg_abs_factor = dbg_map.get('abs_factor')
                 dbg_abs_mu = dbg_map.get('abs_mu')
@@ -2451,6 +2524,12 @@ class App:
                 dbg_latency_ms = None if (dbg_latency_s is None) else (float(dbg_latency_s) * 1000.0)
                 if (not brake_reason) and hold_blocked and hold_reason in ('stop_sign','red_light','obstacle'):
                     brake_reason = hold_reason
+                hazard_since_prev = getattr(self, '_hazard_confirm_since', -1.0)
+                if bool(dbg_gate_confirmed):
+                    if hazard_since_prev < 0.0:
+                        self._hazard_confirm_since = sim_time
+                else:
+                    self._hazard_confirm_since = -1.0
                 current_dist = None
                 for cand in (brake_target, nearest_s_active, tl_s_active if tl_state == 'RED' else None, last_s0):
                     if cand is None:
@@ -2514,6 +2593,17 @@ class App:
                     episode_abs_factor_count = 0
                     episode_false_flag = False
                     episode_t_start = sim_time
+                    if dbg_ttc is not None and math.isfinite(dbg_ttc):
+                        episode_ttc_init = float(dbg_ttc)
+                        episode_ttc_min = float(dbg_ttc)
+                    else:
+                        episode_ttc_init = None
+                        episode_ttc_min = None
+                    hazard_since = getattr(self, '_hazard_confirm_since', -1.0)
+                    if hazard_since >= 0.0:
+                        episode_reaction_time = max(0.0, sim_time - hazard_since)
+                    else:
+                        episode_reaction_time = None
                 elif episode_active:
                     if current_dist is not None:
                         episode_s_min = min(episode_s_min, current_dist)
@@ -2526,6 +2616,15 @@ class App:
                         episode_abs_factor_count += 1
                     if false_stop_flag:
                         episode_false_flag = True
+                    if dbg_ttc is not None and math.isfinite(dbg_ttc):
+                        if episode_ttc_min is None:
+                            episode_ttc_min = float(dbg_ttc)
+                        else:
+                            episode_ttc_min = min(episode_ttc_min, float(dbg_ttc))
+                    if episode_reaction_time is None and (brake_active or hold_brake):
+                        hazard_since = getattr(self, '_hazard_confirm_since', -1.0)
+                        if hazard_since >= 0.0:
+                            episode_reaction_time = max(0.0, sim_time - hazard_since)
                     still_active = activation
                     # Episode considered finished once vehicle has effectively stopped
                     # or braking band / hold is released (returned to cruising).
@@ -2548,6 +2647,9 @@ class App:
                                 if stopped:
                                     theoretical = episode_v_init / max(0.1, MU * 9.81)
                                     tts_margin = t_to_stop - theoretical
+                                ttc_init_logged = episode_ttc_init if (episode_ttc_init is not None and math.isfinite(episode_ttc_init)) else None
+                                ttc_min_logged = episode_ttc_min if (episode_ttc_min is not None and math.isfinite(episode_ttc_min)) else None
+                                reaction_logged = episode_reaction_time if (episode_reaction_time is not None and math.isfinite(episode_reaction_time)) else None
                                 max_lambda_val = episode_lambda_max if episode_lambda_max > 0 else None
                                 mean_abs_factor = None
                                 if episode_abs_factor_count > 0:
@@ -2568,6 +2670,9 @@ class App:
                                     collision_state,
                                     range_margin,
                                     tts_margin,
+                                    ttc_init_logged,
+                                    ttc_min_logged,
+                                    reaction_logged,
                                     max_lambda_val,
                                     mean_abs_factor,
                                     false_stop_episode,
@@ -2581,6 +2686,9 @@ class App:
                         episode_abs_factor_sum = 0.0
                         episode_abs_factor_count = 0
                         episode_false_flag = False
+                        episode_ttc_init = None
+                        episode_ttc_min = None
+                        episode_reaction_time = None
 
                 self._prev_brake_activation = activation
 
@@ -2637,6 +2745,14 @@ class App:
                                 bool(v < V_STOP),
                                 0.0,
                                 True,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                False,
                             )
                         except Exception:
                             pass
@@ -2647,6 +2763,7 @@ class App:
                 perf_ms = loop_ms
                 perf_fps = 1000.0 / loop_ms if loop_ms > 0 else 0.0
                 ema_loop_ms = 0.9*ema_loop_ms + 0.1*loop_ms
+                loop_ms_max = max(loop_ms_max, loop_ms)
                 v_prev = v
                 if not getattr(self.args, 'no_opencv', False) and not self.headless:
                     cv2.waitKey(1)
@@ -2689,9 +2806,11 @@ class App:
                         self.telemetry.maybe_log(sim_time, v, dbg_tau_dyn, dbg_D_safety_dyn, dbg_sigma_depth,
                                                  dbg_a_des, dbg_brake,
                                                  dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime,
-                                                 loop_ms, detect_ms, dbg_latency_ms,
+                                                 loop_ms, loop_ms_max, detect_ms, dbg_latency_ms,
                                                  a_long, x_rel_gt, range_est,
-                                                 dbg_gate_hit, false_stop_flag)
+                                                 dbg_ttc,
+                                                 dbg_gate_hit, dbg_gate_confirmed,
+                                                 false_stop_flag)
                     except Exception:
                         pass
                 clock.tick(int(1.0/DT))
@@ -2758,6 +2877,12 @@ def parse_args():
                         help='Also set wheel.tire_friction≈mu to make the sim physically slick.')
     parser.add_argument('--persist-frames', type=int, default=2,
                         help='Consecutive frames required to confirm a stop‑sign before arming the stop latch')
+    parser.add_argument('--min-aeb-speed', type=float, default=V_AEB_MIN_DEFAULT,
+                        help='Minimum ego speed (m/s) before obstacle-triggered AEB can engage')
+    parser.add_argument('--gate-confirm-frames', type=int, default=GATE_CONFIRM_FRAMES_DEFAULT,
+                        help='Consecutive gate-hit frames required before obstacle braking is allowed')
+    parser.add_argument('--ttc-confirm-s', type=float, default=TTC_CONFIRM_S_DEFAULT,
+                        help='TTC threshold (seconds) that must be met before obstacle braking is allowed')
     parser.add_argument('--range-est', type=str, default='pinhole',
                         choices=['pinhole', 'depth', 'stereo', 'both'],
                         help='Distance source: monocular pinhole, CARLA depth, stereo vision, or log both (depth vs pinhole)')
