@@ -94,6 +94,193 @@ ABS_V_MAX         = 4.0
 ABS_B_MIN         = 0.20
 ABS_PWM_SCALE     = 0.5
 
+# Slip controller defaults (per-wheel PI + μ adaptation)
+FRICTION_CONFIGS = {
+    'high':   {'lambda_star': 0.18, 'kp': 5.0, 'ki': 25.0},
+    'medium': {'lambda_star': 0.15, 'kp': 4.0, 'ki': 20.0},
+    'low':    {'lambda_star': 0.10, 'kp': 3.0, 'ki': 12.0},
+}
+
+# False-stop heuristics for telemetry/episode labeling
+FALSE_STOP_MARGIN_M = 5.0      # if actual gap exceeds safety distance by this margin while braking → suspicious
+FALSE_STOP_TTC_S    = 4.0      # TTC above this while brake engaged → likely false stop
+
+
+def compute_slip_per_wheel(v_ego: float, wheel_speeds: List[float]) -> List[float]:
+    """Return longitudinal slip λ for each wheel in [0, 1]."""
+
+    v = max(0.1, float(v_ego))
+    slips: List[float] = []
+    for v_w in wheel_speeds:
+        try:
+            v_w = max(0.0, float(v_w))
+        except Exception:
+            v_w = 0.0
+        lam = (v - v_w) / v
+        lam = max(0.0, min(1.0, lam))
+        slips.append(lam)
+    return slips
+
+
+class PISlipChannel:
+    def __init__(self, dt: float,
+                 lambda_star: float = 0.15,
+                 kp: float = 4.0,
+                 ki: float = 20.0):
+        self.dt = dt
+        self.lambda_star = lambda_star
+        self.kp = kp
+        self.ki = ki
+        self.I = 0.0
+        self.f = 1.0
+
+    def reset(self):
+        self.I = 0.0
+        self.f = 1.0
+
+    def step(self, lam: float) -> float:
+        e = float(self.lambda_star) - float(max(0.0, min(1.0, lam)))
+        u_raw = self.kp * e + self.I
+        f_unsat = u_raw
+        f_sat = max(0.0, min(1.0, f_unsat))
+        if (f_unsat > 1.0 and e > 0.0) or (f_unsat < 0.0 and e < 0.0):
+            pass
+        else:
+            self.I += self.ki * e * self.dt
+        self.f = f_sat
+        return self.f
+
+
+class FrictionEstimator:
+    def __init__(self, g: float = 9.81, alpha: float = 0.05, mu_init: float = 0.8):
+        self.g = g
+        self.alpha = alpha
+        self.mu_est = mu_init
+
+    def reset(self):
+        self.mu_est = 0.8
+
+    def update(self, v_ego: float, lambda_max: float, a_long: float, brake_req: float):
+        if v_ego < 5.0:
+            return
+        if brake_req < 0.3:
+            return
+        if lambda_max < 0.10 or lambda_max > 0.25:
+            return
+        if not math.isfinite(a_long):
+            return
+        mu_inst = abs(a_long) / self.g
+        mu_inst = max(0.01, min(1.5, mu_inst))
+        self.mu_est = (1.0 - self.alpha) * self.mu_est + self.alpha * mu_inst
+
+    def regime(self) -> str:
+        mu = self.mu_est
+        if mu > 0.8:
+            return 'high'
+        if mu > 0.4:
+            return 'medium'
+        return 'low'
+
+
+class PISlipABSActuator:
+    def __init__(self, dt: float,
+                 lambda_star: float = 0.15,
+                 kp: float = 4.0,
+                 ki: float = 20.0,
+                 v_min_abs: float = 3.0,
+                 wheel_count: int = 4):
+        self.dt = dt
+        self.v_min_abs = v_min_abs
+        self.channels = [PISlipChannel(dt, lambda_star, kp, ki) for _ in range(wheel_count)]
+        self.last_lambda_max = 0.0
+        self.last_f_global = 1.0
+
+    def reset(self):
+        for ch in self.channels:
+            ch.reset()
+        self.last_lambda_max = 0.0
+        self.last_f_global = 1.0
+
+    def _eligible(self, v_ego: float, wheel_speeds: List[float]) -> bool:
+        return v_ego >= self.v_min_abs and len(wheel_speeds) == len(self.channels)
+
+    def step(self, brake_req: float, v_ego: float, wheel_speeds: List[float], a_long: float = 0.0) -> float:
+        del a_long  # unused in fixed-mode actuator
+        brake_req = max(0.0, min(1.0, float(brake_req)))
+        if not self._eligible(v_ego, wheel_speeds):
+            self.last_lambda_max = 0.0
+            self.last_f_global = 1.0
+            for ch in self.channels:
+                ch.reset()
+            return brake_req
+        slips = compute_slip_per_wheel(v_ego, wheel_speeds)
+        self.last_lambda_max = max(slips) if slips else 0.0
+        f_list = [ch.step(lam) for ch, lam in zip(self.channels, slips)]
+        f_global = min(f_list) if f_list else 1.0
+        self.last_f_global = f_global
+        return brake_req * f_global
+
+    def debug_metrics(self) -> Dict[str, Any]:
+        return {
+            'lambda_max': self.last_lambda_max,
+            'f_global': self.last_f_global,
+            'mu_est': None,
+            'regime': 'fixed',
+        }
+
+
+class AdaptivePISlipABSActuator(PISlipABSActuator):
+    def __init__(self, dt: float, v_min_abs: float = 3.0,
+                 wheel_count: int = 4,
+                 friction_configs: Optional[Dict[str, Dict[str, float]]] = None):
+        super().__init__(dt, v_min_abs=v_min_abs, wheel_count=wheel_count)
+        self.friction = FrictionEstimator()
+        self.friction_configs = friction_configs if friction_configs is not None else FRICTION_CONFIGS
+        self.current_regime = 'medium'
+        self._apply_friction_config(self.current_regime)
+
+    def _apply_friction_config(self, regime: str):
+        cfg = self.friction_configs.get(regime, self.friction_configs['medium'])
+        for ch in self.channels:
+            ch.lambda_star = cfg['lambda_star']
+            ch.kp = cfg['kp']
+            ch.ki = cfg['ki']
+            ch.reset()
+        self.current_regime = regime
+
+    def reset(self):
+        super().reset()
+        self.friction.reset()
+        self._apply_friction_config('medium')
+
+    def step(self, brake_req: float, v_ego: float, wheel_speeds: List[float], a_long: float = 0.0) -> float:
+        brake_req = max(0.0, min(1.0, float(brake_req)))
+        if not self._eligible(v_ego, wheel_speeds):
+            self.last_lambda_max = 0.0
+            self.last_f_global = 1.0
+            for ch in self.channels:
+                ch.reset()
+            return brake_req
+        slips = compute_slip_per_wheel(v_ego, wheel_speeds)
+        lambda_max = max(slips) if slips else 0.0
+        self.last_lambda_max = lambda_max
+        self.friction.update(v_ego, lambda_max, a_long, brake_req)
+        regime = self.friction.regime()
+        if regime != self.current_regime:
+            self._apply_friction_config(regime)
+        f_list = [ch.step(lam) for ch, lam in zip(self.channels, slips)]
+        f_global = min(f_list) if f_list else 1.0
+        self.last_f_global = f_global
+        return brake_req * f_global
+
+    def debug_metrics(self) -> Dict[str, Any]:
+        return {
+            'lambda_max': self.last_lambda_max,
+            'f_global': self.last_f_global,
+            'mu_est': self.friction.mu_est,
+            'regime': self.current_regime,
+        }
+
 # Detection (YOLO specific)
 YOLO_MODEL_PATH   = 'yolo12n.pt'     # path to YOLO12n weights
 CONF_THR_DEFAULT  = 0.45
@@ -1099,6 +1286,52 @@ class WorldManager:
         except Exception:
             pass
 
+    def lead_distance_ahead(self, lateral_max: float = LATERAL_MAX + 0.5, max_distance: float = 150.0) -> Optional[float]:
+        """Return Euclidean distance to the closest actor ahead of the ego vehicle."""
+
+        try:
+            ego = self.ego
+            if ego is None:
+                return None
+            ego_loc = ego.get_location()
+            ego_rot = ego.get_transform().rotation
+        except Exception:
+            return None
+
+        try:
+            actors = self.world.get_actors()
+        except Exception:
+            return None
+
+        yaw = math.radians(ego_rot.yaw)
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        best = None
+        for actor in actors:
+            try:
+                if actor.id == ego.id:
+                    continue
+                tid = actor.type_id.lower()
+                if not (tid.startswith('vehicle.') or tid.startswith('walker.')):
+                    continue
+                loc = actor.get_location()
+            except Exception:
+                continue
+            dx = loc.x - ego_loc.x
+            dy = loc.y - ego_loc.y
+            longitudinal = dx * cos_yaw + dy * sin_yaw
+            if longitudinal <= 0.0:
+                continue
+            lateral = -dx * sin_yaw + dy * cos_yaw
+            if abs(lateral) > lateral_max:
+                continue
+            dist = math.sqrt(dx*dx + dy*dy)
+            if dist > max_distance:
+                continue
+            if (best is None) or (dist < best):
+                best = dist
+        return best
+
     # ---- NPC helpers ----
     def _spawn_npc_vehicles(self, count: int, autopilot: bool, speed_diff_pct: int):
         bp_lib = self.world.get_blueprint_library()
@@ -1172,10 +1405,20 @@ class _TelemetryLogger:
         self._last_t = -1e9
         self._csv_f = open(self.path, 'w', newline='')
         self._w = csv.writer(self._csv_f)
-        self._w.writerow(['t','v_mps','tau_dyn','D_safety_dyn','sigma_depth','a_des','brake'])
+        self._w.writerow([
+            't','v_mps','tau_dyn','D_safety_dyn','sigma_depth','a_des','brake',
+            'lambda_max','abs_factor','mu_est','mu_regime',
+            'loop_ms','detect_ms','latency_ms','a_meas','x_rel_m','range_est_m',
+            'gate_hit','false_stop_flag'
+        ])
 
     def maybe_log(self, t: float, v: float, tau_dyn: Optional[float], D_safety_dyn: Optional[float],
-                  sigma_depth: Optional[float], a_des: Optional[float], brake: Optional[float]):
+                  sigma_depth: Optional[float], a_des: Optional[float], brake: Optional[float],
+                  lambda_max: Optional[float], abs_factor: Optional[float],
+                  mu_est: Optional[float], mu_regime: Optional[str],
+                  loop_ms: Optional[float], detect_ms: Optional[float], latency_ms: Optional[float],
+                  a_meas: Optional[float], x_rel_m: Optional[float], range_est_m: Optional[float],
+                  gate_hit: Optional[bool], false_stop_flag: Optional[bool]):
         if t - self._last_t >= self.period:
             self._last_t = t
             self._w.writerow([
@@ -1185,6 +1428,18 @@ class _TelemetryLogger:
                 (None if sigma_depth is None else float(sigma_depth)),
                 (None if a_des is None else float(a_des)),
                 (None if brake is None else float(brake)),
+                (None if lambda_max is None else float(lambda_max)),
+                (None if abs_factor is None else float(abs_factor)),
+                (None if mu_est is None else float(mu_est)),
+                mu_regime,
+                (None if loop_ms is None else float(loop_ms)),
+                (None if detect_ms is None else float(detect_ms)),
+                (None if latency_ms is None else float(latency_ms)),
+                (None if a_meas is None else float(a_meas)),
+                (None if x_rel_m is None else float(x_rel_m)),
+                (None if range_est_m is None else float(range_est_m)),
+                (None if gate_hit is None else int(bool(gate_hit))),
+                (None if false_stop_flag is None else int(bool(false_stop_flag))),
             ])
 
     def close(self):
@@ -1209,13 +1464,20 @@ class _ScenarioLogger:
         self._w.writerow([
             'scenario', 'trigger_kind', 'mu',
             'v_init_mps', 's_init_m', 's_min_m',
-            'stopped', 't_to_stop_s', 'collision'
+            's_init_gt_m', 's_min_gt_m',
+            'stopped', 't_to_stop_s', 'collision',
+            'range_margin_m', 'tts_margin_s',
+            'max_lambda', 'mean_abs_factor', 'false_stop'
         ])
         self._f.flush()
 
     def log(self, scenario: str, trigger_kind: str, mu: float,
             v_init: float, s_init: float, s_min: float,
-            stopped: bool, t_to_stop: float, collision: bool):
+            s_init_gt: Optional[float], s_min_gt: Optional[float],
+            stopped: bool, t_to_stop: float, collision: bool,
+            range_margin: Optional[float], tts_margin: Optional[float],
+            max_lambda: Optional[float], mean_abs_factor: Optional[float],
+            false_stop: bool):
         self._w.writerow([
             scenario,
             trigger_kind,
@@ -1223,9 +1485,16 @@ class _ScenarioLogger:
             float(v_init),
             float(s_init),
             float(s_min),
+            (None if s_init_gt is None else float(s_init_gt)),
+            (None if s_min_gt is None else float(s_min_gt)),
             bool(stopped),
             float(t_to_stop),
             bool(collision),
+            (None if range_margin is None else float(range_margin)),
+            (None if tts_margin is None else float(tts_margin)),
+            (None if max_lambda is None else float(max_lambda)),
+            (None if mean_abs_factor is None else float(mean_abs_factor)),
+            bool(false_stop),
         ])
         self._f.flush()
 
@@ -1266,6 +1535,13 @@ class App:
         self.range = RangeEstimator(use_cuda=self.args.stereo_cuda, method=self.args.stereo_method)
         self.world: Optional[WorldManager] = None
         self.sensors: Optional[SensorRig] = None
+        self.abs_mode: str = getattr(self.args, 'abs_mode', 'adaptive')
+        if self.abs_mode == 'off':
+            self.abs_actuator: Optional[PISlipABSActuator] = None
+        elif self.abs_mode == 'fixed':
+            self.abs_actuator = PISlipABSActuator(dt=DT)
+        else:
+            self.abs_actuator = AdaptivePISlipABSActuator(dt=DT)
         # Telemetry set up
         self.telemetry: Optional[_TelemetryLogger] = None
         if getattr(self.args, 'telemetry_csv', None):
@@ -1306,7 +1582,11 @@ class App:
                    hold_reason, no_trigger_elapsed, no_red_elapsed, stop_armed,
                    stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
                    dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target,
-                   collision_flag: bool):
+                   collision_flag: bool,
+                   abs_lambda: Optional[float] = None,
+                   abs_factor: Optional[float] = None,
+                   abs_mu: Optional[float] = None,
+                   abs_regime: Optional[str] = None):
         if self.headless:
             return
         surf_front = bgr_to_pygame_surface(bgr)
@@ -1326,9 +1606,92 @@ class App:
         if dbg_tau_dyn is not None:
             shadow(screen, f'tau={dbg_tau_dyn:0.2f}  Dsafe={dbg_D_safety_dyn:0.1f} m  sigma={dbg_sigma_depth:0.2f} m  gate={int(dbg_gate_hit)}  a_des={dbg_a_des:0.2f}  brk={dbg_brake:0.2f}  Vtgt={v_target*3.6:0.0f}km/h',
                    (10, IMG_H-24), (255,255,0))
+        if abs_lambda is not None or abs_factor is not None or abs_mu is not None:
+            slip_txt = 'n/a' if abs_lambda is None else f'{abs_lambda:.2f}'
+            fac_txt = '1.00' if abs_factor is None else f'{abs_factor:.2f}'
+            mu_txt = 'n/a' if abs_mu is None else f'{abs_mu:.2f}'
+            regime_txt = abs_regime or 'n/a'
+            shadow(screen,
+                   f'ABS slip={slip_txt}  f={fac_txt}  mu_est={mu_txt}  regime={regime_txt}',
+                   (10, IMG_H-46), (180,255,255))
         if collision_flag:
             shadow(screen, '*** COLLISION DETECTED ***', (IMG_W//4, IMG_H//2), (255,40,40))
         pygame.display.flip()
+
+    def _get_wheel_linear_speeds(self) -> List[float]:
+        if self.abs_actuator is None:
+            return []
+        if self.world is None or getattr(self.world, 'ego', None) is None:
+            return []
+        veh = self.world.ego
+        radii: List[float] = []
+        try:
+            phys = veh.get_physics_control()
+            wheels = getattr(phys, 'wheels', None)
+            if wheels:
+                for w in wheels:
+                    try:
+                        radii.append(max(0.05, float(getattr(w, 'radius', 0.35))))
+                    except Exception:
+                        radii.append(0.35)
+        except Exception:
+            pass
+
+        def _coerce(val: Any) -> Optional[float]:
+            if val is None:
+                return None
+            if isinstance(val, (list, tuple)) and val:
+                try:
+                    return float(val[0])
+                except Exception:
+                    return None
+            if hasattr(val, 'x') and hasattr(val, 'y') and hasattr(val, 'z'):
+                try:
+                    return math.sqrt(float(val.x)**2 + float(val.y)**2 + float(val.z)**2)
+                except Exception:
+                    return None
+            try:
+                return float(val)
+            except Exception:
+                return None
+
+        ang_vals: List[float] = []
+        method = getattr(veh, 'get_wheel_angular_velocity', None)
+        if callable(method):
+            seq_vals = None
+            try:
+                seq = method()
+                if isinstance(seq, (list, tuple)):
+                    seq_vals = seq
+            except TypeError:
+                seq_vals = None
+            except Exception:
+                seq_vals = None
+            if seq_vals is not None:
+                for val in seq_vals:
+                    coerced = _coerce(val)
+                    if coerced is not None:
+                        ang_vals.append(max(0.0, coerced))
+            if not ang_vals:
+                count = len(radii) if radii else 4
+                for idx in range(count):
+                    try:
+                        val = method(idx)
+                    except TypeError:
+                        break
+                    except Exception:
+                        continue
+                    coerced = _coerce(val)
+                    if coerced is not None:
+                        ang_vals.append(max(0.0, coerced))
+
+        if not ang_vals:
+            return []
+        if not radii:
+            radii = [0.34] * len(ang_vals)
+        if len(radii) < len(ang_vals):
+            radii.extend([radii[-1]] * (len(ang_vals) - len(radii)))
+        return [max(0.0, ang * max(0.05, radius)) for ang, radius in zip(ang_vals, radii)]
 
     # --- IO: read sensors and decode ---
     def _read_frames(self, frames: Dict[str, Any]) -> Dict[str, Any]:
@@ -1603,7 +1966,7 @@ class App:
         D_safety_dyn = D_MIN + K_LAT_D*(v*latency_s) + K_UNC_D*sigma_depth + K_MU_D*mu_short
         D_safety_dyn = self._D_safety_dyn_prev + max(-1.0, min(1.0, D_safety_dyn - self._D_safety_dyn_prev))
         self._D_safety_dyn_prev = D_safety_dyn
-        return tau_dyn, D_safety_dyn, sigma_depth
+        return tau_dyn, D_safety_dyn, sigma_depth, latency_s
 
     # --- Control step: throttle/brake/hold ---
     def _control_step(self,
@@ -1665,11 +2028,12 @@ class App:
 
         dbg = {'tau_dyn': None, 'D_safety_dyn': None, 'sigma_depth': None, 'gate_hit': False,
                'a_des': None, 'brake': None, 'brake_active': in_brake_band,
-               'brake_reason': brake_reason, 'brake_target_dist': nearest_s_active}
+               'brake_reason': brake_reason, 'brake_target_dist': nearest_s_active,
+               'latency_s': None}
 
         if in_brake_band and (nearest_s_active is not None):
             s_used = 0.7 * (last_s0 if last_s0 is not None else nearest_s_active) + 0.3 * nearest_s_active
-            tau_dyn, D_safety_dyn, sigma_depth = self._safety_envelope(v, MU, ema_loop_ms, nearest_box, nearest_conf, depth_m, depth_stereo_m)
+            tau_dyn, D_safety_dyn, sigma_depth, latency_s = self._safety_envelope(v, MU, ema_loop_ms, nearest_box, nearest_conf, depth_m, depth_stereo_m)
             required_dist_physics = (v*v)/(2.0*max(1e-3, A_MU)) + v*tau_dyn + D_safety_dyn
             gate_hit = (required_dist_physics >= s_used)
 
@@ -1702,6 +2066,7 @@ class App:
             dbg.update({'tau_dyn': tau_dyn, 'D_safety_dyn': D_safety_dyn, 'sigma_depth': sigma_depth,
                         'gate_hit': gate_hit, 'a_des': a_des, 'brake': brake,
                         'brake_reason': brake_reason, 'brake_target_dist': nearest_s_active,
+                        'latency_s': latency_s,
                         'brake_active': True})
 
         elif hold_blocked:
@@ -1903,6 +2268,12 @@ class App:
         episode_v_init = 0.0
         episode_s_init = 0.0
         episode_s_min = float('inf')
+        episode_s_init_gt = float('nan')
+        episode_s_min_gt = float('inf')
+        episode_lambda_max = 0.0
+        episode_abs_factor_sum = 0.0
+        episode_abs_factor_count = 0
+        episode_false_flag = False
         episode_t_start = 0.0
         if not hasattr(self, '_prev_brake_activation'):
             self._prev_brake_activation = False
@@ -1942,6 +2313,8 @@ class App:
                 prev_loc = loc
                 v = ALPHA_VBLEND * v_raw + (1.0 - ALPHA_VBLEND) * v_disp
                 if v < 0.05: v = 0.0
+                wheel_speeds = self._get_wheel_linear_speeds()
+                a_long = 0.0 if v_prev is None else (v - v_prev) / DT
 
                 if not getattr(self.args, 'no_opencv', False) and not self.headless:
                     max_vis = 120.0
@@ -1950,7 +2323,10 @@ class App:
                     vis8 = cv2.applyColorMap(vis8, cv2.COLORMAP_PLASMA)
                     cv2.imshow('DEPTH', vis8)
                 # Perception step (YOLO + depth/stereo + gating)
+                detect_ms = None
+                detect_t0 = time.time()
                 perc = self._perception_step(bgr, depth_m, depth_stereo_m, FX_, FY_, CX_, CY_, sim_time, v, MU, log_both, csv_w)
+                detect_ms = (time.time() - detect_t0) * 1000.0
                 bgr = perc['bgr']
                 det_points = perc['det_points']
                 nearest_s_active = perc['nearest_s_active']
@@ -1963,6 +2339,13 @@ class App:
                 tl_det_box = perc['tl_det_box']
                 stop_detected_current = perc['stop_detected_current']
                 any_red_tl = (tl_state == 'RED')
+
+                x_rel_gt = None
+                if self.world is not None:
+                    try:
+                        x_rel_gt = self.world.lead_distance_ahead()
+                    except Exception:
+                        x_rel_gt = None
 
                 if any_red_tl and (tl_s_active is not None):
                     if (nearest_s_active is None) or (tl_s_active < nearest_s_active):
@@ -2030,15 +2413,42 @@ class App:
                                        red_green_since, no_trigger_elapsed, no_red_elapsed,
                                        depth_m, depth_stereo_m, nearest_box, nearest_conf,
                                        I_err, v_prev)
+                abs_lambda = None
+                abs_factor = None
+                abs_mu = None
+                abs_regime = 'off' if self.abs_actuator is None else None
+                abs_dbg = None
+                if self.abs_actuator is not None:
+                    try:
+                        brake = self.abs_actuator.step(brake, v, wheel_speeds, a_long)
+                        abs_dbg = self.abs_actuator.debug_metrics()
+                    except Exception:
+                        abs_dbg = None
+                    if abs_dbg is not None:
+                        abs_lambda = abs_dbg.get('lambda_max')
+                        abs_factor = abs_dbg.get('f_global')
+                        abs_mu = abs_dbg.get('mu_est')
+                        abs_regime = abs_dbg.get('regime')
+                dbg_map['brake'] = brake
+                dbg_map['abs_lambda_max'] = abs_lambda
+                dbg_map['abs_factor'] = abs_factor
+                dbg_map['abs_mu'] = abs_mu
+                dbg_map['abs_regime'] = abs_regime
                 dbg_tau_dyn = dbg_map.get('tau_dyn')
                 dbg_D_safety_dyn = dbg_map.get('D_safety_dyn')
                 dbg_sigma_depth = dbg_map.get('sigma_depth')
                 dbg_gate_hit = dbg_map.get('gate_hit')
                 dbg_a_des = dbg_map.get('a_des')
                 dbg_brake = dbg_map.get('brake')
+                dbg_abs_lambda = dbg_map.get('abs_lambda_max')
+                dbg_abs_factor = dbg_map.get('abs_factor')
+                dbg_abs_mu = dbg_map.get('abs_mu')
+                dbg_abs_regime = dbg_map.get('abs_regime')
                 brake_active = bool(dbg_map.get('brake_active'))
                 brake_reason = dbg_map.get('brake_reason')
                 brake_target = dbg_map.get('brake_target_dist')
+                dbg_latency_s = dbg_map.get('latency_s')
+                dbg_latency_ms = None if (dbg_latency_s is None) else (float(dbg_latency_s) * 1000.0)
                 if (not brake_reason) and hold_blocked and hold_reason in ('stop_sign','red_light','obstacle'):
                     brake_reason = hold_reason
                 current_dist = None
@@ -2053,6 +2463,25 @@ class App:
                         continue
                     current_dist = val
                     break
+
+                range_est = current_dist
+                false_stop_flag = False
+                if brake_active:
+                    gate_state = bool(dbg_gate_hit)
+                    if x_rel_gt is None or not math.isfinite(x_rel_gt):
+                        false_stop_flag = True
+                    else:
+                        if not gate_state:
+                            if dbg_D_safety_dyn is not None and math.isfinite(dbg_D_safety_dyn):
+                                margin_val = x_rel_gt - dbg_D_safety_dyn
+                                if margin_val > FALSE_STOP_MARGIN_M:
+                                    false_stop_flag = True
+                            if v > 0.1:
+                                ttc = x_rel_gt / max(v, 0.1)
+                                if ttc > FALSE_STOP_TTC_S:
+                                    false_stop_flag = True
+                else:
+                    false_stop_flag = False
 
                 # --- Episode bookkeeping: start/end of braking events ---
                 reason_allowed = brake_reason in ('obstacle','stop_sign','red_light')
@@ -2078,10 +2507,25 @@ class App:
                     episode_v_init = v
                     episode_s_init = float(start_dist)
                     episode_s_min = float(start_dist)
+                    episode_s_init_gt = float(x_rel_gt) if (x_rel_gt is not None and math.isfinite(x_rel_gt)) else float(start_dist)
+                    episode_s_min_gt = float(episode_s_init_gt)
+                    episode_lambda_max = abs_lambda if (abs_lambda is not None) else 0.0
+                    episode_abs_factor_sum = 0.0
+                    episode_abs_factor_count = 0
+                    episode_false_flag = False
                     episode_t_start = sim_time
                 elif episode_active:
                     if current_dist is not None:
                         episode_s_min = min(episode_s_min, current_dist)
+                    if x_rel_gt is not None and math.isfinite(x_rel_gt):
+                        episode_s_min_gt = min(episode_s_min_gt, x_rel_gt)
+                    if abs_lambda is not None:
+                        episode_lambda_max = max(episode_lambda_max, abs_lambda)
+                    if abs_factor is not None:
+                        episode_abs_factor_sum += abs_factor
+                        episode_abs_factor_count += 1
+                    if false_stop_flag:
+                        episode_false_flag = True
                     still_active = activation
                     # Episode considered finished once vehicle has effectively stopped
                     # or braking band / hold is released (returned to cruising).
@@ -2090,22 +2534,53 @@ class App:
                         t_to_stop = max(0.0, sim_time - episode_t_start)
                         if self.scenario_logger is not None:
                             try:
+                                s_init_logged = episode_s_init
+                                s_min_logged = episode_s_min if math.isfinite(episode_s_min) else episode_s_init
+                                s_init_gt_logged = episode_s_init_gt if math.isfinite(episode_s_init_gt) else None
+                                s_min_gt_logged = episode_s_min_gt if math.isfinite(episode_s_min_gt) else None
+                                if (s_init_gt_logged is not None) and (s_min_gt_logged is not None):
+                                    range_margin = s_init_gt_logged - s_min_gt_logged
+                                elif math.isfinite(s_init_logged) and math.isfinite(s_min_logged):
+                                    range_margin = s_init_logged - s_min_logged
+                                else:
+                                    range_margin = None
+                                tts_margin = None
+                                if stopped:
+                                    theoretical = episode_v_init / max(0.1, MU * 9.81)
+                                    tts_margin = t_to_stop - theoretical
+                                max_lambda_val = episode_lambda_max if episode_lambda_max > 0 else None
+                                mean_abs_factor = None
+                                if episode_abs_factor_count > 0:
+                                    mean_abs_factor = episode_abs_factor_sum / episode_abs_factor_count
+                                collision_state = bool(self.world.collision_happened if self.world is not None else False)
+                                false_stop_episode = bool(episode_false_flag or ((not collision_state) and (range_margin is not None) and (range_margin > FALSE_STOP_MARGIN_M)))
                                 self.scenario_logger.log(
                                     getattr(self.args, 'scenario_tag', 'default'),
                                     str(episode_trigger or 'unknown'),
                                     MU,
                                     episode_v_init,
-                                    episode_s_init,
-                                    episode_s_min if math.isfinite(episode_s_min) else episode_s_init,
+                                    s_init_logged,
+                                    s_min_logged,
+                                    s_init_gt_logged,
+                                    s_min_gt_logged,
                                     bool(stopped),
                                     t_to_stop,
-                                    bool(self.world.collision_happened if self.world is not None else False),
+                                    collision_state,
+                                    range_margin,
+                                    tts_margin,
+                                    max_lambda_val,
+                                    mean_abs_factor,
+                                    false_stop_episode,
                                 )
                             except Exception:
                                 pass
                         episode_active = False
                         episode_trigger = None
                         self._collision_logged_count = getattr(self, '_collision_logged_count', 0)
+                        episode_lambda_max = 0.0
+                        episode_abs_factor_sum = 0.0
+                        episode_abs_factor_count = 0
+                        episode_false_flag = False
 
                 self._prev_brake_activation = activation
 
@@ -2131,7 +2606,7 @@ class App:
                                    hold_reason, no_trigger_elapsed, no_red_elapsed, stop_armed,
                                    stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
                                    dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target,
-                                   collision_flag)
+                                   collision_flag, dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime)
 
                 # Periodic concise console log for tuning
                 logN = int(getattr(self.args, 'log_interval_frames', 0) or 0)
@@ -2211,7 +2686,12 @@ class App:
                 # Telemetry
                 if self.telemetry is not None:
                     try:
-                        self.telemetry.maybe_log(sim_time, v, dbg_tau_dyn, dbg_D_safety_dyn, dbg_sigma_depth, dbg_a_des, dbg_brake)
+                        self.telemetry.maybe_log(sim_time, v, dbg_tau_dyn, dbg_D_safety_dyn, dbg_sigma_depth,
+                                                 dbg_a_des, dbg_brake,
+                                                 dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime,
+                                                 loop_ms, detect_ms, dbg_latency_ms,
+                                                 a_long, x_rel_gt, range_est,
+                                                 dbg_gate_hit, false_stop_flag)
                     except Exception:
                         pass
                 clock.tick(int(1.0/DT))
@@ -2272,6 +2752,8 @@ def parse_args():
     parser.add_argument('--port', type=int, default=2000)
     parser.add_argument('--town', type=str, default='Town10HD_Opt', help='Town name, e.g., Town03 or Town05_Opt')
     parser.add_argument('--mu', type=float, default=MU_DEFAULT, help='Road friction estimate (dry~0.9, wet~0.6, ice~0.2)')
+    parser.add_argument('--abs-mode', type=str, default='adaptive', choices=['off','fixed','adaptive'],
+                        help='Slip controller: off (direct brake), fixed PI ABS, or μ-adaptive PI ABS')
     parser.add_argument('--apply-tire-friction', action='store_true',
                         help='Also set wheel.tire_friction≈mu to make the sim physically slick.')
     parser.add_argument('--persist-frames', type=int, default=2,
