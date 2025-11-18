@@ -1,5 +1,5 @@
 from __future__ import print_function
-import os, sys, math, argparse, random, queue, glob
+import os, sys, math, argparse, random, queue, glob, csv
 import time
 from typing import Optional, Tuple, List, Dict, Any
 from collections import deque, Counter
@@ -1959,6 +1959,37 @@ class App:
         self.telephoto_zoom = max(1.0, min(TELEPHOTO_DIGITAL_ZOOM_MAX, zoom_raw))
         self.telephoto_intrinsics = intrinsics_from_fov(TELEPHOTO_IMG_W, TELEPHOTO_IMG_H, TELEPHOTO_FOV_X_DEG)
         self._tl_state_history: deque = deque(maxlen=TL_STATE_SMOOTHING_FRAMES)
+        self._telephoto_compute_totals: Dict[str, Any] = {
+            'primary_calls': 0,
+            'primary_time_s': 0.0,
+            'telephoto_calls': 0,
+            'telephoto_time_s': 0.0,
+            'telephoto_invocations': 0,
+            'telephoto_frames_considered': 0,
+            'telephoto_skipped_disabled': 0,
+            'telephoto_skipped_stride': 0,
+            'telephoto_cache_hits': 0,
+        }
+        self.telephoto_compute_log_path = getattr(self.args, 'telephoto_compute_log', None)
+        self.telephoto_compute_fp = None
+        self.telephoto_compute_writer = None
+        if self.telephoto_compute_log_path:
+            try:
+                self.telephoto_compute_fp = open(self.telephoto_compute_log_path, 'w', newline='')
+                self.telephoto_compute_writer = csv.writer(self.telephoto_compute_fp)
+                self.telephoto_compute_writer.writerow([
+                    'timestamp', 'telephoto_enabled', 'telephoto_stride', 'telephoto_zoom',
+                    'primary_calls', 'primary_total_ms',
+                    'telephoto_invocations', 'telephoto_frames_considered',
+                    'telephoto_calls', 'telephoto_total_ms',
+                    'telephoto_cache_hits', 'telephoto_skipped_stride', 'telephoto_skipped_disabled',
+                    'with_telephoto_total_ms', 'without_telephoto_total_ms'
+                ])
+            except Exception as e:
+                print(f"[WARN] Failed to open telephoto compute log: {e}")
+                self.telephoto_compute_log_path = None
+                self.telephoto_compute_fp = None
+                self.telephoto_compute_writer = None
         self._telephoto_last_candidate: Optional[Dict[str, Any]] = None
         self._telephoto_last_time: float = -1.0
         self._frame_index = 0
@@ -2235,7 +2266,9 @@ class App:
                          tele_bgr: Optional[np.ndarray] = None,
                          tele_depth_m: Optional[np.ndarray] = None) -> Dict[str, Any]:
         labels = self.detector.labels or {}
+        detect_t0 = time.perf_counter()
         classIds, confs, boxes = self.detector.predict_raw(bgr)
+        self._record_compute_time('primary', time.perf_counter() - detect_t0)
 
         nearest_s_active = None
         nearest_kind = None
@@ -2495,16 +2528,83 @@ class App:
             return best_state, best_dist
         return state, distance
 
+    def _record_compute_time(self, scope: str, duration_s: float):
+        stats = getattr(self, '_telephoto_compute_totals', None)
+        if stats is None or duration_s is None:
+            return
+        if scope == 'primary':
+            stats['primary_calls'] += 1
+            stats['primary_time_s'] += max(0.0, float(duration_s))
+        elif scope == 'telephoto':
+            stats['telephoto_calls'] += 1
+            stats['telephoto_time_s'] += max(0.0, float(duration_s))
+
+    def _maybe_write_telephoto_compute_summary(self):
+        stats = getattr(self, '_telephoto_compute_totals', None)
+        if not stats:
+            return
+        primary_ms = stats.get('primary_time_s', 0.0) * 1000.0
+        telephoto_ms = stats.get('telephoto_time_s', 0.0) * 1000.0
+        with_ms = primary_ms + telephoto_ms
+        without_ms = primary_ms
+        if stats.get('primary_calls', 0) == 0 and stats.get('telephoto_invocations', 0) == 0:
+            return
+        try:
+            print(
+                f"[TELEPHOTO] compute totals | primary={primary_ms:.1f}ms (calls={stats.get('primary_calls', 0)}) "
+                f"telephoto={telephoto_ms:.1f}ms (runs={stats.get('telephoto_calls', 0)} stride_skips={stats.get('telephoto_skipped_stride', 0)}) "
+                f"with={with_ms:.1f}ms vs without={without_ms:.1f}ms"
+            )
+        except Exception:
+            pass
+        writer = getattr(self, 'telephoto_compute_writer', None)
+        fp = getattr(self, 'telephoto_compute_fp', None)
+        if writer is None or fp is None:
+            return
+        timestamp = time.time()
+        try:
+            writer.writerow([
+                f"{timestamp:.3f}",
+                bool(self.telephoto_enabled),
+                int(self.telephoto_stride),
+                float(self.telephoto_zoom),
+                stats.get('primary_calls', 0),
+                f"{primary_ms:.3f}",
+                stats.get('telephoto_invocations', 0),
+                stats.get('telephoto_frames_considered', 0),
+                stats.get('telephoto_calls', 0),
+                f"{telephoto_ms:.3f}",
+                stats.get('telephoto_cache_hits', 0),
+                stats.get('telephoto_skipped_stride', 0),
+                stats.get('telephoto_skipped_disabled', 0),
+                f"{with_ms:.3f}",
+                f"{without_ms:.3f}",
+            ])
+            fp.flush()
+        except Exception:
+            pass
+
     def _maybe_run_telephoto_tl(self, tele_bgr: Optional[np.ndarray], tele_depth_m: Optional[np.ndarray],
                                 depth_roi: float, sim_time: float) -> Optional[Dict[str, Any]]:
+        stats = getattr(self, '_telephoto_compute_totals', None)
+        if stats is not None:
+            stats['telephoto_invocations'] += 1
         if not self.telephoto_enabled or tele_bgr is None:
+            if stats is not None:
+                stats['telephoto_skipped_disabled'] += 1
             return None
         stride = max(2, int(self.telephoto_stride))
+        if stats is not None:
+            stats['telephoto_frames_considered'] += 1
         frame_idx = getattr(self, '_frame_index', 0)
         run_now = (frame_idx % stride) == 0
         cached = getattr(self, '_telephoto_last_candidate', None)
         if not run_now:
+            if stats is not None:
+                stats['telephoto_skipped_stride'] += 1
             if cached is not None and (sim_time - float(self._telephoto_last_time)) <= TELEPHOTO_CACHE_MAX_AGE_S:
+                if stats is not None:
+                    stats['telephoto_cache_hits'] += 1
                 return cached
             return None
 
@@ -2512,7 +2612,9 @@ class App:
         zoom_meta = None
         if self.telephoto_zoom > 1.0 + 1e-3:
             infer_img, zoom_meta = apply_digital_zoom(tele_bgr, self.telephoto_zoom)
+        t0 = time.perf_counter()
         classIds, confs, boxes = self.detector.predict_raw(infer_img)
+        self._record_compute_time('telephoto', time.perf_counter() - t0)
         labels = self.detector.labels or {}
         best: Optional[Dict[str, Any]] = None
         _, fy_t, _, _ = self.telephoto_intrinsics
@@ -3576,6 +3678,15 @@ class App:
                     self.scenario_logger.close()
                 except Exception:
                     pass
+            try:
+                self._maybe_write_telephoto_compute_summary()
+            except Exception:
+                pass
+            if self.telephoto_compute_fp is not None:
+                try:
+                    self.telephoto_compute_fp.close()
+                except Exception:
+                    pass
             if self.video_writer is not None:
                 try:
                     self.video_writer.release()
@@ -3647,6 +3758,8 @@ def parse_args():
     parser.add_argument('--telephoto-zoom', type=float, default=TELEPHOTO_DIGITAL_ZOOM_DEFAULT,
                         help='Digital zoom factor (>=1.0) for the telephoto feed (crop upper-center, resize, reuse boxes).'
                              ' Default=1.5; set to 1.0 to disable')
+    parser.add_argument('--telephoto-compute-log', type=str, default=None,
+                        help='Optional CSV path to log total compute time with/without telephoto assists (plus cache/skip stats)')
     parser.add_argument('--headless', action='store_true',
                         help='Run without GUI windows (also disables OpenCV windows)')
 

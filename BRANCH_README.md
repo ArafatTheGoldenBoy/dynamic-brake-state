@@ -17,8 +17,11 @@ The default CARLA single-camera setup struggles with distant lights and wastes G
 ## Configuration checklist
 - `--no-telephoto`: disable the telephoto branch entirely.
 - `--telephoto-stride N`: only run telephoto YOLO every N frames (default 3).
-- `--telephoto-digital-zoom FACTOR`: enable digital zoom for the telephoto helper; FACTOR > 1 crops tighter before resizing back to the detector resolution.
+- `--telephoto-zoom FACTOR`: enable digital zoom for the telephoto helper; FACTOR > 1 crops tighter before resizing back to the detector resolution.
+- `--telephoto-compute-log PATH`: write a CSV summary containing total YOLO compute time for the primary stream, the telephoto helper, plus cache hits/stride skips so you can compare "with telephoto" vs "without telephoto" runtime cost after the drive.
 - `dynamic_brake_state.py` constants (search for `TELEPHOTO_DIGITAL_ZOOM_*`) fine-tune crop ratios and zoom placement.
+
+Each compute-log row captures the telephoto toggle state, stride/zoom, total call counts, cumulative milliseconds for both camera paths, cache hits, and skipped frames. The last two columns already report the rolled-up milliseconds with and without the telephoto assist applied; check those to quantify the savings from throttling or disabling the helper entirely.
 
 ## Testing
 Run `python -m compileall dynamic_brake_state.py` or your preferred CARLA scenario playback. For live validation, launch CARLA with both cameras enabled and observe the logged source/ distance entries whenever traffic lights enter/leave the <50 m window.
