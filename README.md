@@ -183,6 +183,14 @@ python dynamic_brake_state.py --preset fast --headless --no-opencv
 
 For more detailed experiment recipes and thesis‑style result suggestions, see `RESULTS.md`.
 
+### ABS actuator experiments
+
+- `ABS_EXPERIMENTS.md` documents the complete workflow for the slip-based ABS actuator:
+  - Signal definitions, per-wheel PI control, and μ-adaptation strategy.
+  - Runtime commands for `--abs-mode off|fixed|adaptive`, telemetry/scenario logging, and HUD diagnostics.
+  - Surface/controller experiment grid, required metrics, and ready-to-fill tables for the thesis Results chapter.
+  - Offline analysis workflow (`results_analysis.py`) plus a publication-ready checklist.
+
 ---
 
 ## Thesis Usage
