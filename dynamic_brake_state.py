@@ -94,6 +94,189 @@ ABS_V_MAX         = 4.0
 ABS_B_MIN         = 0.20
 ABS_PWM_SCALE     = 0.5
 
+# Slip controller defaults (per-wheel PI + μ adaptation)
+FRICTION_CONFIGS = {
+    'high':   {'lambda_star': 0.18, 'kp': 5.0, 'ki': 25.0},
+    'medium': {'lambda_star': 0.15, 'kp': 4.0, 'ki': 20.0},
+    'low':    {'lambda_star': 0.10, 'kp': 3.0, 'ki': 12.0},
+}
+
+
+def compute_slip_per_wheel(v_ego: float, wheel_speeds: List[float]) -> List[float]:
+    """Return longitudinal slip λ for each wheel in [0, 1]."""
+
+    v = max(0.1, float(v_ego))
+    slips: List[float] = []
+    for v_w in wheel_speeds:
+        try:
+            v_w = max(0.0, float(v_w))
+        except Exception:
+            v_w = 0.0
+        lam = (v - v_w) / v
+        lam = max(0.0, min(1.0, lam))
+        slips.append(lam)
+    return slips
+
+
+class PISlipChannel:
+    def __init__(self, dt: float,
+                 lambda_star: float = 0.15,
+                 kp: float = 4.0,
+                 ki: float = 20.0):
+        self.dt = dt
+        self.lambda_star = lambda_star
+        self.kp = kp
+        self.ki = ki
+        self.I = 0.0
+        self.f = 1.0
+
+    def reset(self):
+        self.I = 0.0
+        self.f = 1.0
+
+    def step(self, lam: float) -> float:
+        e = float(self.lambda_star) - float(max(0.0, min(1.0, lam)))
+        u_raw = self.kp * e + self.I
+        f_unsat = u_raw
+        f_sat = max(0.0, min(1.0, f_unsat))
+        if (f_unsat > 1.0 and e > 0.0) or (f_unsat < 0.0 and e < 0.0):
+            pass
+        else:
+            self.I += self.ki * e * self.dt
+        self.f = f_sat
+        return self.f
+
+
+class FrictionEstimator:
+    def __init__(self, g: float = 9.81, alpha: float = 0.05, mu_init: float = 0.8):
+        self.g = g
+        self.alpha = alpha
+        self.mu_est = mu_init
+
+    def reset(self):
+        self.mu_est = 0.8
+
+    def update(self, v_ego: float, lambda_max: float, a_long: float, brake_req: float):
+        if v_ego < 5.0:
+            return
+        if brake_req < 0.3:
+            return
+        if lambda_max < 0.10 or lambda_max > 0.25:
+            return
+        if not math.isfinite(a_long):
+            return
+        mu_inst = abs(a_long) / self.g
+        mu_inst = max(0.01, min(1.5, mu_inst))
+        self.mu_est = (1.0 - self.alpha) * self.mu_est + self.alpha * mu_inst
+
+    def regime(self) -> str:
+        mu = self.mu_est
+        if mu > 0.8:
+            return 'high'
+        if mu > 0.4:
+            return 'medium'
+        return 'low'
+
+
+class PISlipABSActuator:
+    def __init__(self, dt: float,
+                 lambda_star: float = 0.15,
+                 kp: float = 4.0,
+                 ki: float = 20.0,
+                 v_min_abs: float = 3.0,
+                 wheel_count: int = 4):
+        self.dt = dt
+        self.v_min_abs = v_min_abs
+        self.channels = [PISlipChannel(dt, lambda_star, kp, ki) for _ in range(wheel_count)]
+        self.last_lambda_max = 0.0
+        self.last_f_global = 1.0
+
+    def reset(self):
+        for ch in self.channels:
+            ch.reset()
+        self.last_lambda_max = 0.0
+        self.last_f_global = 1.0
+
+    def _eligible(self, v_ego: float, wheel_speeds: List[float]) -> bool:
+        return v_ego >= self.v_min_abs and len(wheel_speeds) == len(self.channels)
+
+    def step(self, brake_req: float, v_ego: float, wheel_speeds: List[float], a_long: float = 0.0) -> float:
+        del a_long  # unused in fixed-mode actuator
+        brake_req = max(0.0, min(1.0, float(brake_req)))
+        if not self._eligible(v_ego, wheel_speeds):
+            self.last_lambda_max = 0.0
+            self.last_f_global = 1.0
+            for ch in self.channels:
+                ch.reset()
+            return brake_req
+        slips = compute_slip_per_wheel(v_ego, wheel_speeds)
+        self.last_lambda_max = max(slips) if slips else 0.0
+        f_list = [ch.step(lam) for ch, lam in zip(self.channels, slips)]
+        f_global = min(f_list) if f_list else 1.0
+        self.last_f_global = f_global
+        return brake_req * f_global
+
+    def debug_metrics(self) -> Dict[str, Any]:
+        return {
+            'lambda_max': self.last_lambda_max,
+            'f_global': self.last_f_global,
+            'mu_est': None,
+            'regime': 'fixed',
+        }
+
+
+class AdaptivePISlipABSActuator(PISlipABSActuator):
+    def __init__(self, dt: float, v_min_abs: float = 3.0,
+                 wheel_count: int = 4,
+                 friction_configs: Optional[Dict[str, Dict[str, float]]] = None):
+        super().__init__(dt, v_min_abs=v_min_abs, wheel_count=wheel_count)
+        self.friction = FrictionEstimator()
+        self.friction_configs = friction_configs if friction_configs is not None else FRICTION_CONFIGS
+        self.current_regime = 'medium'
+        self._apply_friction_config(self.current_regime)
+
+    def _apply_friction_config(self, regime: str):
+        cfg = self.friction_configs.get(regime, self.friction_configs['medium'])
+        for ch in self.channels:
+            ch.lambda_star = cfg['lambda_star']
+            ch.kp = cfg['kp']
+            ch.ki = cfg['ki']
+            ch.reset()
+        self.current_regime = regime
+
+    def reset(self):
+        super().reset()
+        self.friction.reset()
+        self._apply_friction_config('medium')
+
+    def step(self, brake_req: float, v_ego: float, wheel_speeds: List[float], a_long: float = 0.0) -> float:
+        brake_req = max(0.0, min(1.0, float(brake_req)))
+        if not self._eligible(v_ego, wheel_speeds):
+            self.last_lambda_max = 0.0
+            self.last_f_global = 1.0
+            for ch in self.channels:
+                ch.reset()
+            return brake_req
+        slips = compute_slip_per_wheel(v_ego, wheel_speeds)
+        lambda_max = max(slips) if slips else 0.0
+        self.last_lambda_max = lambda_max
+        self.friction.update(v_ego, lambda_max, a_long, brake_req)
+        regime = self.friction.regime()
+        if regime != self.current_regime:
+            self._apply_friction_config(regime)
+        f_list = [ch.step(lam) for ch, lam in zip(self.channels, slips)]
+        f_global = min(f_list) if f_list else 1.0
+        self.last_f_global = f_global
+        return brake_req * f_global
+
+    def debug_metrics(self) -> Dict[str, Any]:
+        return {
+            'lambda_max': self.last_lambda_max,
+            'f_global': self.last_f_global,
+            'mu_est': self.friction.mu_est,
+            'regime': self.current_regime,
+        }
+
 # Detection (YOLO specific)
 YOLO_MODEL_PATH   = 'yolo12n.pt'     # path to YOLO12n weights
 CONF_THR_DEFAULT  = 0.45
@@ -1172,10 +1355,15 @@ class _TelemetryLogger:
         self._last_t = -1e9
         self._csv_f = open(self.path, 'w', newline='')
         self._w = csv.writer(self._csv_f)
-        self._w.writerow(['t','v_mps','tau_dyn','D_safety_dyn','sigma_depth','a_des','brake'])
+        self._w.writerow([
+            't','v_mps','tau_dyn','D_safety_dyn','sigma_depth','a_des','brake',
+            'lambda_max','abs_factor','mu_est','mu_regime'
+        ])
 
     def maybe_log(self, t: float, v: float, tau_dyn: Optional[float], D_safety_dyn: Optional[float],
-                  sigma_depth: Optional[float], a_des: Optional[float], brake: Optional[float]):
+                  sigma_depth: Optional[float], a_des: Optional[float], brake: Optional[float],
+                  lambda_max: Optional[float], abs_factor: Optional[float],
+                  mu_est: Optional[float], mu_regime: Optional[str]):
         if t - self._last_t >= self.period:
             self._last_t = t
             self._w.writerow([
@@ -1185,6 +1373,10 @@ class _TelemetryLogger:
                 (None if sigma_depth is None else float(sigma_depth)),
                 (None if a_des is None else float(a_des)),
                 (None if brake is None else float(brake)),
+                (None if lambda_max is None else float(lambda_max)),
+                (None if abs_factor is None else float(abs_factor)),
+                (None if mu_est is None else float(mu_est)),
+                mu_regime,
             ])
 
     def close(self):
@@ -1266,6 +1458,13 @@ class App:
         self.range = RangeEstimator(use_cuda=self.args.stereo_cuda, method=self.args.stereo_method)
         self.world: Optional[WorldManager] = None
         self.sensors: Optional[SensorRig] = None
+        self.abs_mode: str = getattr(self.args, 'abs_mode', 'adaptive')
+        if self.abs_mode == 'off':
+            self.abs_actuator: Optional[PISlipABSActuator] = None
+        elif self.abs_mode == 'fixed':
+            self.abs_actuator = PISlipABSActuator(dt=DT)
+        else:
+            self.abs_actuator = AdaptivePISlipABSActuator(dt=DT)
         # Telemetry set up
         self.telemetry: Optional[_TelemetryLogger] = None
         if getattr(self.args, 'telemetry_csv', None):
@@ -1306,7 +1505,11 @@ class App:
                    hold_reason, no_trigger_elapsed, no_red_elapsed, stop_armed,
                    stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
                    dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target,
-                   collision_flag: bool):
+                   collision_flag: bool,
+                   abs_lambda: Optional[float] = None,
+                   abs_factor: Optional[float] = None,
+                   abs_mu: Optional[float] = None,
+                   abs_regime: Optional[str] = None):
         if self.headless:
             return
         surf_front = bgr_to_pygame_surface(bgr)
@@ -1326,9 +1529,92 @@ class App:
         if dbg_tau_dyn is not None:
             shadow(screen, f'tau={dbg_tau_dyn:0.2f}  Dsafe={dbg_D_safety_dyn:0.1f} m  sigma={dbg_sigma_depth:0.2f} m  gate={int(dbg_gate_hit)}  a_des={dbg_a_des:0.2f}  brk={dbg_brake:0.2f}  Vtgt={v_target*3.6:0.0f}km/h',
                    (10, IMG_H-24), (255,255,0))
+        if abs_lambda is not None or abs_factor is not None or abs_mu is not None:
+            slip_txt = 'n/a' if abs_lambda is None else f'{abs_lambda:.2f}'
+            fac_txt = '1.00' if abs_factor is None else f'{abs_factor:.2f}'
+            mu_txt = 'n/a' if abs_mu is None else f'{abs_mu:.2f}'
+            regime_txt = abs_regime or 'n/a'
+            shadow(screen,
+                   f'ABS slip={slip_txt}  f={fac_txt}  mu_est={mu_txt}  regime={regime_txt}',
+                   (10, IMG_H-46), (180,255,255))
         if collision_flag:
             shadow(screen, '*** COLLISION DETECTED ***', (IMG_W//4, IMG_H//2), (255,40,40))
         pygame.display.flip()
+
+    def _get_wheel_linear_speeds(self) -> List[float]:
+        if self.abs_actuator is None:
+            return []
+        if self.world is None or getattr(self.world, 'ego', None) is None:
+            return []
+        veh = self.world.ego
+        radii: List[float] = []
+        try:
+            phys = veh.get_physics_control()
+            wheels = getattr(phys, 'wheels', None)
+            if wheels:
+                for w in wheels:
+                    try:
+                        radii.append(max(0.05, float(getattr(w, 'radius', 0.35))))
+                    except Exception:
+                        radii.append(0.35)
+        except Exception:
+            pass
+
+        def _coerce(val: Any) -> Optional[float]:
+            if val is None:
+                return None
+            if isinstance(val, (list, tuple)) and val:
+                try:
+                    return float(val[0])
+                except Exception:
+                    return None
+            if hasattr(val, 'x') and hasattr(val, 'y') and hasattr(val, 'z'):
+                try:
+                    return math.sqrt(float(val.x)**2 + float(val.y)**2 + float(val.z)**2)
+                except Exception:
+                    return None
+            try:
+                return float(val)
+            except Exception:
+                return None
+
+        ang_vals: List[float] = []
+        method = getattr(veh, 'get_wheel_angular_velocity', None)
+        if callable(method):
+            seq_vals = None
+            try:
+                seq = method()
+                if isinstance(seq, (list, tuple)):
+                    seq_vals = seq
+            except TypeError:
+                seq_vals = None
+            except Exception:
+                seq_vals = None
+            if seq_vals is not None:
+                for val in seq_vals:
+                    coerced = _coerce(val)
+                    if coerced is not None:
+                        ang_vals.append(max(0.0, coerced))
+            if not ang_vals:
+                count = len(radii) if radii else 4
+                for idx in range(count):
+                    try:
+                        val = method(idx)
+                    except TypeError:
+                        break
+                    except Exception:
+                        continue
+                    coerced = _coerce(val)
+                    if coerced is not None:
+                        ang_vals.append(max(0.0, coerced))
+
+        if not ang_vals:
+            return []
+        if not radii:
+            radii = [0.34] * len(ang_vals)
+        if len(radii) < len(ang_vals):
+            radii.extend([radii[-1]] * (len(ang_vals) - len(radii)))
+        return [max(0.0, ang * max(0.05, radius)) for ang, radius in zip(ang_vals, radii)]
 
     # --- IO: read sensors and decode ---
     def _read_frames(self, frames: Dict[str, Any]) -> Dict[str, Any]:
@@ -1942,6 +2228,8 @@ class App:
                 prev_loc = loc
                 v = ALPHA_VBLEND * v_raw + (1.0 - ALPHA_VBLEND) * v_disp
                 if v < 0.05: v = 0.0
+                wheel_speeds = self._get_wheel_linear_speeds()
+                a_long = 0.0 if v_prev is None else (v - v_prev) / DT
 
                 if not getattr(self.args, 'no_opencv', False) and not self.headless:
                     max_vis = 120.0
@@ -2030,12 +2318,37 @@ class App:
                                        red_green_since, no_trigger_elapsed, no_red_elapsed,
                                        depth_m, depth_stereo_m, nearest_box, nearest_conf,
                                        I_err, v_prev)
+                abs_lambda = None
+                abs_factor = None
+                abs_mu = None
+                abs_regime = 'off' if self.abs_actuator is None else None
+                abs_dbg = None
+                if self.abs_actuator is not None:
+                    try:
+                        brake = self.abs_actuator.step(brake, v, wheel_speeds, a_long)
+                        abs_dbg = self.abs_actuator.debug_metrics()
+                    except Exception:
+                        abs_dbg = None
+                    if abs_dbg is not None:
+                        abs_lambda = abs_dbg.get('lambda_max')
+                        abs_factor = abs_dbg.get('f_global')
+                        abs_mu = abs_dbg.get('mu_est')
+                        abs_regime = abs_dbg.get('regime')
+                dbg_map['brake'] = brake
+                dbg_map['abs_lambda_max'] = abs_lambda
+                dbg_map['abs_factor'] = abs_factor
+                dbg_map['abs_mu'] = abs_mu
+                dbg_map['abs_regime'] = abs_regime
                 dbg_tau_dyn = dbg_map.get('tau_dyn')
                 dbg_D_safety_dyn = dbg_map.get('D_safety_dyn')
                 dbg_sigma_depth = dbg_map.get('sigma_depth')
                 dbg_gate_hit = dbg_map.get('gate_hit')
                 dbg_a_des = dbg_map.get('a_des')
                 dbg_brake = dbg_map.get('brake')
+                dbg_abs_lambda = dbg_map.get('abs_lambda_max')
+                dbg_abs_factor = dbg_map.get('abs_factor')
+                dbg_abs_mu = dbg_map.get('abs_mu')
+                dbg_abs_regime = dbg_map.get('abs_regime')
                 brake_active = bool(dbg_map.get('brake_active'))
                 brake_reason = dbg_map.get('brake_reason')
                 brake_target = dbg_map.get('brake_target_dist')
@@ -2131,7 +2444,7 @@ class App:
                                    hold_reason, no_trigger_elapsed, no_red_elapsed, stop_armed,
                                    stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
                                    dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target,
-                                   collision_flag)
+                                   collision_flag, dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime)
 
                 # Periodic concise console log for tuning
                 logN = int(getattr(self.args, 'log_interval_frames', 0) or 0)
@@ -2211,7 +2524,9 @@ class App:
                 # Telemetry
                 if self.telemetry is not None:
                     try:
-                        self.telemetry.maybe_log(sim_time, v, dbg_tau_dyn, dbg_D_safety_dyn, dbg_sigma_depth, dbg_a_des, dbg_brake)
+                        self.telemetry.maybe_log(sim_time, v, dbg_tau_dyn, dbg_D_safety_dyn, dbg_sigma_depth,
+                                                 dbg_a_des, dbg_brake,
+                                                 dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime)
                     except Exception:
                         pass
                 clock.tick(int(1.0/DT))
@@ -2272,6 +2587,8 @@ def parse_args():
     parser.add_argument('--port', type=int, default=2000)
     parser.add_argument('--town', type=str, default='Town10HD_Opt', help='Town name, e.g., Town03 or Town05_Opt')
     parser.add_argument('--mu', type=float, default=MU_DEFAULT, help='Road friction estimate (dry~0.9, wet~0.6, ice~0.2)')
+    parser.add_argument('--abs-mode', type=str, default='adaptive', choices=['off','fixed','adaptive'],
+                        help='Slip controller: off (direct brake), fixed PI ABS, or μ-adaptive PI ABS')
     parser.add_argument('--apply-tire-friction', action='store_true',
                         help='Also set wheel.tire_friction≈mu to make the sim physically slick.')
     parser.add_argument('--persist-frames', type=int, default=2,

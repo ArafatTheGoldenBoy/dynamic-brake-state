@@ -15,6 +15,10 @@ Per time step the script logs:
 - `sigma_depth` – depth uncertainty [m]
 - `a_des` – desired deceleration [m/s²]
 - `brake` – normalized brake command [0–1]
+- `lambda_max` – max per-wheel slip λ observed during that tick
+- `abs_factor` – global ABS modulation factor (min of per-wheel channels)
+- `mu_est` – online friction estimate from the μ-adaptation logic
+- `mu_regime` – textual regime (`off`, `fixed`, `low`, `medium`, `high`)
 
 Use this for plots such as `v(t)`, `D_safety_dyn(t)`, and `tau_dyn(t)`.
 
@@ -113,6 +117,50 @@ python dynamic_brake_state.py `
 ```
 
 During the run (with GUI enabled), press `S` to save annotated PNG snapshots.
+
+### 2.5 Slip-Controller Experiments (ABS vs No ABS)
+
+The script now exposes a per-wheel PI slip controller with optional μ-adaptation. Use the CLI knob `--abs-mode` to switch between:
+
+- `--abs-mode off` → direct `VehicleControl.brake` (baseline, no ABS)
+- `--abs-mode fixed` → fixed λ* = 0.15 PI slip control
+- `--abs-mode adaptive` → μ-adaptive λ*/gain scheduling (default)
+
+Recommended experiment grid:
+
+1. Surfaces: dry (`--mu 0.9`), wet (`--mu 0.6`), ice (`--mu 0.2`), and split-μ (manually set `WheelPhysicsControl.friction_force_multiplier` on left/right wheels before the run). Pass `--apply-tire-friction` so the CARLA wheel model matches the requested μ.
+2. Initial speeds: e.g., 50 km/h and 80 km/h per surface.
+3. Controllers: run each combination with `--abs-mode off`, `fixed`, and `adaptive`.
+
+Log telemetry (`--telemetry-csv`) and braking episodes (`--scenario-csv`) for every run. From telemetry you can compute slip statistics using the new columns (`lambda_max`, `abs_factor`, `mu_est`). From the scenario CSV you get stopping distances and collision/stop outcomes.
+
+**Suggested metrics per run:**
+
+- Stopping distance (`s_init_m - s_min_m` or integrate `v(t)` until stop)
+- Impact speed (speed at collision if it occurs)
+- Peak deceleration (`max |dv/dt|`, obtainable from telemetry `v(t)`)
+- Mean slip (`mean(lambda_max)` over active braking)
+- Slip overshoot (`max(lambda_max - λ*_{regime})`)
+- ABS duty cycle (`time where abs_factor < 1` / total braking time)
+- Comfort proxy (`max jerk`, derivative of longitudinal acceleration)
+
+Summarize the study with a table per initial speed, for example (fill in with your measurements):
+
+**Table: Braking performance across controllers (v₀ = 80 km/h)**
+
+| Surface | Controller      | Stopping dist [m] | Impact v [km/h] | Peak decel [m/s²] | Mean slip [-] | Slip overshoot [-] | ABS duty [%] | Comfort (max jerk) [m/s³] |
+| ------- | --------------- | ----------------- | --------------- | ----------------- | ------------- | ------------------ | ------------ | ------------------------- |
+| Dry     | No ABS          | ...               | ...             | ...               | ...           | ...                | ...          | ...                       |
+| Dry     | Fixed PI-ABS    | ...               | ...             | ...               | ...           | ...                | ...          | ...                       |
+| Dry     | Adaptive PI-ABS | ...               | ...             | ...               | ...           | ...                | ...          | ...                       |
+| Wet     | No ABS          | ...               | ...             | ...               | ...           | ...                | ...          | ...                       |
+| Wet     | Fixed PI-ABS    | ...               | ...             | ...               | ...           | ...                | ...          | ...                       |
+| Wet     | Adaptive PI-ABS | ...               | ...             | ...               | ...           | ...                | ...          | ...                       |
+| Ice     | No ABS          | ...               | ...             | ...               | ...           | ...                | ...          | ...                       |
+| Ice     | Fixed PI-ABS    | ...               | ...             | ...               | ...           | ...                | ...          | ...                       |
+| Ice     | Adaptive PI-ABS | ...               | ...             | ...               | ...           | ...                | ...          | ...                       |
+
+Repeat for additional v₀ values and highlight how the adaptive controller keeps slip in-band and shortens stopping distance on low-μ surfaces.
 
 ---
 
