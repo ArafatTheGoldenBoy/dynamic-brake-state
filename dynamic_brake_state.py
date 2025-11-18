@@ -407,6 +407,144 @@ class LeadKalmanTracker:
             'age': None if self.last_meas_time is None else float(sim_time - self.last_meas_time),
         }
 
+
+class LeadMultiObjectTracker:
+    """Maintain multiple Kalman tracks with ID assignments for lead selection."""
+
+    def __init__(self, dt: float,
+                 max_tracks: int = 4,
+                 assoc_iou_min: float = 0.2,
+                 tracker_kwargs: Optional[Dict[str, Any]] = None):
+        self.dt = dt
+        self.max_tracks = max(1, int(max_tracks))
+        self.assoc_iou_min = max(0.0, float(assoc_iou_min))
+        self._tracker_kwargs = tracker_kwargs or {}
+        self._tracks: Dict[int, LeadKalmanTracker] = {}
+        self._track_meta: Dict[int, Dict[str, Any]] = {}
+        self._next_id = 1
+
+    def reset(self):
+        for tracker in self._tracks.values():
+            tracker.reset()
+        self._tracks.clear()
+        self._track_meta.clear()
+        self._next_id = 1
+
+    def deactivate(self):
+        self.reset()
+
+    def _new_tracker(self) -> LeadKalmanTracker:
+        return LeadKalmanTracker(dt=self.dt, **self._tracker_kwargs)
+
+    def _assoc_score(self, track_id: int, measurement: Dict[str, Any]) -> float:
+        tracker = self._tracks.get(track_id)
+        if tracker is None:
+            return 0.0
+        overlap = iou_xywh(getattr(tracker, 'box', None), measurement.get('box'))
+        if overlap < self.assoc_iou_min:
+            return 0.0
+        score = overlap
+        kind = measurement.get('kind')
+        if tracker.kind is not None and kind is not None and tracker.kind == kind:
+            score += 0.2
+        dist = measurement.get('distance')
+        if dist is not None and tracker.active:
+            try:
+                pred = float(tracker.x[0, 0])
+                score += max(0.0, 1.0 - abs(pred - float(dist)) / max(1.0, float(dist)))
+            except Exception:
+                pass
+        return score
+
+    def _ensure_capacity(self):
+        if len(self._tracks) < self.max_tracks:
+            return
+        if not self._tracks:
+            return
+        far_id = None
+        far_dist = -1.0
+        for tid, tracker in self._tracks.items():
+            try:
+                dist = float(tracker.x[0, 0])
+            except Exception:
+                dist = 1e9
+            if dist > far_dist:
+                far_dist = dist
+                far_id = tid
+        if far_id is not None:
+            self._tracks.pop(far_id, None)
+            self._track_meta.pop(far_id, None)
+
+    def step(self, sim_time: float, measurements: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        measurements_sorted = sorted(measurements or [], key=lambda m: m.get('distance', 1e9))
+        assignments: Dict[int, Dict[str, Any]] = {}
+        unmatched: List[Dict[str, Any]] = []
+        for meas in measurements_sorted:
+            best_track = None
+            best_score = 0.0
+            for track_id in self._tracks.keys():
+                if track_id in assignments:
+                    continue
+                score = self._assoc_score(track_id, meas)
+                if score > best_score:
+                    best_score = score
+                    best_track = track_id
+            if best_track is not None:
+                assignments[best_track] = meas
+            else:
+                unmatched.append(meas)
+
+        active_states: List[Dict[str, Any]] = []
+        to_remove: List[int] = []
+        for track_id, tracker in list(self._tracks.items()):
+            meas = assignments.get(track_id)
+            state = tracker.step(sim_time, meas)
+            if state is None:
+                if not tracker.active:
+                    to_remove.append(track_id)
+                continue
+            meta = self._track_meta.setdefault(track_id, {})
+            meta['kind'] = tracker.kind
+            meta['box'] = tracker.box
+            active_states.append({
+                'track_id': track_id,
+                'distance': state.get('distance'),
+                'rate': state.get('rate'),
+                'age': state.get('age'),
+                'kind': tracker.kind,
+                'box': tracker.box,
+            })
+        for tid in to_remove:
+            self._tracks.pop(tid, None)
+            self._track_meta.pop(tid, None)
+
+        for meas in unmatched:
+            self._ensure_capacity()
+            tracker = self._new_tracker()
+            state = tracker.step(sim_time, meas)
+            if state is None:
+                continue
+            track_id = self._next_id
+            self._next_id += 1
+            self._tracks[track_id] = tracker
+            self._track_meta[track_id] = {'kind': tracker.kind, 'box': tracker.box}
+            active_states.append({
+                'track_id': track_id,
+                'distance': state.get('distance'),
+                'rate': state.get('rate'),
+                'age': state.get('age'),
+                'kind': tracker.kind,
+                'box': tracker.box,
+            })
+
+        active_states.sort(key=lambda s: (float('inf') if s.get('distance') is None else float(s['distance'])))
+        best_state = active_states[0] if active_states else None
+        return best_state, active_states
+
+    def active_track_count(self) -> int:
+        return len(self._tracks)
+
+
 # Detection (YOLO specific)
 YOLO_MODEL_PATH   = 'yolo12n.pt'     # path to YOLO12n weights
 CONF_THR_DEFAULT  = 0.45
@@ -1536,7 +1674,8 @@ class _TelemetryLogger:
             'lambda_max','abs_factor','mu_est','mu_regime',
             'loop_ms','loop_ms_max','detect_ms','latency_ms','a_meas','x_rel_m','range_est_m',
             'ttc_s','gate_hit','gate_confirmed','false_stop_flag',
-            'tracker_s_m','tracker_rate_mps','sensor_ts','control_ts','sensor_to_control_ms'
+            'tracker_s_m','tracker_rate_mps','lead_track_id','active_track_count',
+            'sensor_ts','control_ts','sensor_to_control_ms'
         ])
 
     def maybe_log(self, t: float, v: float, tau_dyn: Optional[float], D_safety_dyn: Optional[float],
@@ -1550,6 +1689,7 @@ class _TelemetryLogger:
                   gate_hit: Optional[bool], gate_confirmed: Optional[bool],
                   false_stop_flag: Optional[bool],
                   tracker_s: Optional[float], tracker_rate: Optional[float],
+                  tracker_id: Optional[int], tracker_count: Optional[int],
                   sensor_ts: Optional[float], control_ts: Optional[float],
                   sensor_to_control_ms: Optional[float]):
         if t - self._last_t >= self.period:
@@ -1578,6 +1718,8 @@ class _TelemetryLogger:
                 (None if false_stop_flag is None else int(bool(false_stop_flag))),
                 (None if tracker_s is None else float(tracker_s)),
                 (None if tracker_rate is None else float(tracker_rate)),
+                (None if tracker_id is None else int(tracker_id)),
+                (None if tracker_count is None else int(tracker_count)),
                 (None if sensor_ts is None else float(sensor_ts)),
                 (None if control_ts is None else float(control_ts)),
                 (None if sensor_to_control_ms is None else float(sensor_to_control_ms)),
@@ -1689,7 +1831,7 @@ class App:
             self.abs_actuator = PISlipABSActuator(dt=DT)
         else:
             self.abs_actuator = AdaptivePISlipABSActuator(dt=DT)
-        self._lead_tracker = LeadKalmanTracker(dt=DT)
+        self._lead_tracker = LeadMultiObjectTracker(dt=DT)
         # Telemetry set up
         self.telemetry: Optional[_TelemetryLogger] = None
         if getattr(self.args, 'telemetry_csv', None):
@@ -1895,7 +2037,7 @@ class App:
     # --- Perception: detection, distances, gating, TL/stop extraction ---
     def _perception_step(self, bgr: np.ndarray, depth_m: np.ndarray, depth_stereo_m: Optional[np.ndarray],
                          FX_: float, FY_: float, CX_: float, CY_: float,
-                         sim_time: float, v: float, MU: float,
+                         sim_time: float, sensor_timestamp: Optional[float], v: float, MU: float,
                          log_both: bool, csv_w) -> Dict[str, Any]:
         labels = self.detector.labels or {}
         classIds, confs, boxes = self.detector.predict_raw(bgr)
@@ -1908,6 +2050,7 @@ class App:
         stop_detected_current = False
 
         tl_det_s, tl_det_box, tl_det_state = None, None, 'UNKNOWN'
+        obstacle_measurements: List[Dict[str, Any]] = []
 
         det_points: List[Dict[str, Any]] = []
         depth_cache_depth: Dict[Tuple[int,int,int,int], Optional[float]] = {}
@@ -2023,6 +2166,14 @@ class App:
 
                 if kind is not None and thr_for_kind is not None and nearest_thr is None:
                     nearest_thr = thr_for_kind
+                if kind is not None and kind != 'stop sign' and s_use is not None:
+                    obstacle_measurements.append({
+                        'distance': float(s_use),
+                        'box': (x1, y1, w, h),
+                        'kind': kind,
+                        'timestamp': sensor_timestamp if (sensor_timestamp is not None and math.isfinite(sensor_timestamp)) else sim_time,
+                        'confidence': float(conf),
+                    })
 
                 # HUD points (for distance overlay window)
                 u, v_ = x1 + w/2.0, y1 + h/2.0
@@ -2095,6 +2246,7 @@ class App:
             'tl_s_active': tl_det_s,
             'tl_det_box': tl_det_box,
             'stop_detected_current': stop_detected_current,
+            'obstacle_measurements': obstacle_measurements,
         }
 
     # --- Safety envelope: compute tau_dyn, D_safety_dyn, sigma_depth with smoothing ---
@@ -2545,7 +2697,7 @@ class App:
                 # Perception step (YOLO + depth/stereo + gating)
                 detect_ms = None
                 detect_t0 = time.time()
-                perc = self._perception_step(bgr, depth_m, depth_stereo_m, FX_, FY_, CX_, CY_, sim_time, v, MU, log_both, csv_w)
+                perc = self._perception_step(bgr, depth_m, depth_stereo_m, FX_, FY_, CX_, CY_, sim_time, sensor_timestamp, v, MU, log_both, csv_w)
                 detect_ms = (time.time() - detect_t0) * 1000.0
                 bgr = perc['bgr']
                 det_points = perc['det_points']
@@ -2622,22 +2774,18 @@ class App:
                     red_green_since = -1.0
 
                 tracker_state = None
+                tracker_active_states: List[Dict[str, Any]] = []
                 tracked_distance_for_control = None
                 tracked_rate = None
                 tracker = getattr(self, '_lead_tracker', None)
                 if tracker is not None:
-                    measurement_payload = None
-                    if nearest_s_active is not None:
-                        measurement_payload = {
-                            'distance': nearest_s_active,
-                            'box': nearest_box,
-                            'kind': nearest_kind,
-                            'timestamp': sensor_timestamp,
-                        }
-                    tracker_state = tracker.step(sim_time, measurement_payload)
+                    obstacle_measurements = perc.get('obstacle_measurements', [])
+                    tracker_state, tracker_active_states = tracker.step(sim_time, obstacle_measurements)
                     if tracker_state is not None:
                         tracked_distance_for_control = tracker_state.get('distance')
                         tracked_rate = tracker_state.get('rate')
+                lead_track_id = tracker_state.get('track_id') if tracker_state is not None else None
+                lead_track_count = len(tracker_active_states)
                 if tracked_distance_for_control is None:
                     if nearest_s_active is not None:
                         tracked_distance_for_control = nearest_s_active
@@ -2742,6 +2890,8 @@ class App:
 
                 tracker_distance_logged = tracker_state.get('distance') if tracker_state is not None else None
                 tracker_rate_logged = tracked_rate
+                tracker_id_logged = tracker_state.get('track_id') if tracker_state is not None else None
+                tracker_count_logged = lead_track_count
                 control_timestamp = sim_time
                 sensor_to_control_ms = None
                 if sensor_timestamp is not None and math.isfinite(sensor_timestamp):
@@ -2997,6 +3147,7 @@ class App:
                                                  dbg_gate_hit, dbg_gate_confirmed,
                                                  false_stop_flag,
                                                  tracker_distance_logged, tracker_rate_logged,
+                                                 tracker_id_logged, tracker_count_logged,
                                                  sensor_timestamp, control_timestamp,
                                                  sensor_to_control_ms)
                     except Exception:

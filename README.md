@@ -131,7 +131,7 @@ These knobs feed into the hazard-confirm timer so the telemetry/scenario CSVs no
 
 ### Logged metrics (CSV columns)
 
-- **Telemetry (`--telemetry-csv`)**: `t`, `v_mps`, `tau_dyn`, `D_safety_dyn`, `sigma_depth`, `a_des`, `brake`, `lambda_max`, `abs_factor`, `mu_est`, `mu_regime`, `loop_ms`, `loop_ms_max`, `detect_ms`, `latency_ms`, `a_meas`, `x_rel_m`, `range_est_m`, `ttc_s`, `gate_hit`, `gate_confirmed`, `false_stop_flag`, `tracker_s_m`, `tracker_rate_mps`, `sensor_ts`, `control_ts`, `sensor_to_control_ms`.
+- **Telemetry (`--telemetry-csv`)**: `t`, `v_mps`, `tau_dyn`, `D_safety_dyn`, `sigma_depth`, `a_des`, `brake`, `lambda_max`, `abs_factor`, `mu_est`, `mu_regime`, `loop_ms`, `loop_ms_max`, `detect_ms`, `latency_ms`, `a_meas`, `x_rel_m`, `range_est_m`, `ttc_s`, `gate_hit`, `gate_confirmed`, `false_stop_flag`, `tracker_s_m`, `tracker_rate_mps`, `lead_track_id`, `active_track_count`, `sensor_ts`, `control_ts`, `sensor_to_control_ms`.
 - **Braking episodes (`--scenario-csv`)**: `scenario`, `trigger_kind`, `mu`, `v_init_mps`, `s_init_m`, `s_min_m`, `s_init_gt_m`, `s_min_gt_m`, `stopped`, `t_to_stop_s`, `collision`, `range_margin_m`, `tts_margin_s`, `ttc_init_s`, `ttc_min_s`, `reaction_time_s`, `max_lambda`, `mean_abs_factor`, `false_stop`.
 - **Range comparison (`--range-est both --compare-csv`)**: raw detections with pinhole vs depth distances plus per-class errors, μ, ego speed, and depth-uncertainty snapshots.
 - **Stereo comparison (`--stereo-compare-csv`)**: disparity-based vs depth-camera ground-truth to quantify stereo bias.
@@ -204,7 +204,7 @@ Repeat the command per scenario/tag; the script writes PNGs and CSV summary tabl
 
 ### Tracking & latency terminology
 
-- **Kalman-based persistent tracking** – Each loop feeds the nearest detection (distance + bounding box) into a single-target constant-velocity Kalman filter with IoU gating. The tracker persists through short occlusions (≤0.6 s) and only resets when a new object with low IoU/large range jump appears. `_control_step()` consumes the filtered distance/rate for TTC, meaning the braking target no longer flickers when YOLO jitters.
+- **Kalman-based persistent tracking** – A multi-object tracker maintains several Kalman-filtered candidates (IDs + IoU/class association). `_control_step()` consumes the closest active track (distance + rate), so cut-ins or split detections no longer cause the brake target to flicker frame-to-frame; telemetry logs `lead_track_id` and `active_track_count` for each sample.
 - **Measured sensor-to-actuator delay** – Telemetry now logs the CARLA sensor timestamp, the control-command timestamp, and their difference (`sensor_to_control_ms`). That value captures the real pipeline latency (camera exposure → perception → control command) per frame, while the dynamic safety envelope still uses `latency_ms` as its conservative planning margin. For thesis claims, cite the measured columns and, if needed, compare them with the envelope’s safety margin.
 
 ### ABS actuator experiments (summary)
