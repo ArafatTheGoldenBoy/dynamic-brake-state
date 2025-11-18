@@ -146,16 +146,14 @@ baselines.
 
 ## 7. Telemetry and scenario logs
 
-Frame-level telemetry CSV columns (see `RESULTS.md` §1.1) include:
+Frame-level telemetry CSV columns (see `RESULTS.md` §1.1) now capture:
 
-- Time stamp and ego pose/speed.
-- Safety envelope terms (distance margin, TTC surrogate, depth uncertainty).
-- Control commands (throttle, brake_req, u_brake).
-- ABS diagnostics (`lambda_max`, `abs_factor`, `mu_est`, `abs_regime`).
+- Core signals: time stamp, ego speed, safety distance, τ, depth uncertainty, desired vs. measured decel.
+- ABS diagnostics: `lambda_max`, `abs_factor`, `mu_est`, `mu_regime`.
+- Runtime/perception metrics: `loop_ms`, `detect_ms`, and `latency_ms`.
+- Ground-truth context: `x_rel_m`, `range_est_m`, `gate_hit`, and a live `false_stop_flag`.
 
-Scenario CSV rows (see `RESULTS.md` §1.2) summarize each braking episode:
-initial speed, initial headway, stop time, stopping distance, and collision flag.
-Tag runs with `--scenario-tag` so they’re easy to group offline.
+Scenario CSV rows (see `RESULTS.md` §1.2) summarize each braking episode with both estimate and ground-truth headway, min gap, range/time margins, peak slip, ABS duty, collision flag, and a `false_stop` label. Tag runs with `--scenario-tag` so they’re easy to group offline.
 
 ---
 
@@ -215,8 +213,10 @@ Recommended derived metrics:
        --tag abs_adaptive
    ```
 
-2. Use the emitted charts (speed vs. time, brake vs. time, λ vs. μ) and the
-   summary JSON/CSV files to populate the thesis Results chapter.
+2. Use the emitted charts (`*_speed_gap.png`, `*_brake_slip.png`, `*_mu_est.png`),
+   μ-regime tables, margin CDF, loop-ms histogram, and false-stop summary from
+   `results_analysis.py` to populate the quantitative sections of the Results
+   chapter.
 
 3. Repeat for the `off` and `fixed` modes and compare across friction surfaces
    using the table in §8.

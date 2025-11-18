@@ -19,6 +19,13 @@ Per time step the script logs:
 - `abs_factor` – global ABS modulation factor (min of per-wheel channels)
 - `mu_est` – online friction estimate from the μ-adaptation logic
 - `mu_regime` – textual regime (`off`, `fixed`, `low`, `medium`, `high`)
+- `loop_ms` / `detect_ms` – total control-loop runtime and detector runtime per tick [ms]
+- `latency_ms` – latency value used by the safety envelope (inc. measured loop time and any injected latency)
+- `a_meas` – measured longitudinal acceleration [m/s²]
+- `x_rel_m` – ground-truth distance to the closest object ahead (queried from CARLA actors)
+- `range_est_m` – range estimate used by the controller (depth/stereo/pinhole)
+- `gate_hit` – 1 if the dynamic safety “gate” is currently armed/violated
+- `false_stop_flag` – 1 when braking is active but ground-truth gap shows the event is unnecessary
 
 Use this for plots such as `v(t)`, `D_safety_dyn(t)`, and `tau_dyn(t)`.
 
@@ -28,13 +35,18 @@ Each braking “episode” (gate hit + braking until stop/release) logs a single
 
 - `scenario` – tag from `--scenario-tag` (e.g. `lead_vehicle_15mps`)
 - `trigger_kind` – type of trigger (`car`, `person`, `traffic light`, `stop sign`, etc.)
-- `mu` – friction coefficient in that run
+- `mu` – friction coefficient in that run (used to bin into regimes)
 - `v_init_mps` – ego speed when braking episode started
-- `s_init_m` – distance to trigger when braking started
-- `s_min_m` – minimum distance reached during episode
+- `s_init_m` / `s_min_m` – range estimate when braking started and its minimum
+- `s_init_gt_m` / `s_min_gt_m` – CARLA ground-truth headway at start and min gap
 - `stopped` – boolean: whether ego reached near-zero speed (`v < V_STOP`)
 - `t_to_stop_s` – time from episode start to stop
 - `collision` – boolean: whether any collision was detected
+- `range_margin_m` – headway margin at the closest approach (`s_init_gt_m - s_min_gt_m`)
+- `tts_margin_s` – (actual stop time) − (μ-limited theoretical stop time)
+- `max_lambda` – peak slip observed during the episode
+- `mean_abs_factor` – average ABS modulation factor (`1 -` value approximates duty)
+- `false_stop` – boolean flag when braking was triggered but no real hazard materialized
 
 Use this to compute stopping margins, time-to-stop, and collision rates.
 
@@ -166,38 +178,52 @@ Repeat for additional v₀ values and highlight how the adaptive controller keep
 
 ## 3. Analyzing Results (`results_analysis.py`)
 
-The script `results_analysis.py` summarizes CSVs and produces ready-to-use plots.
+Run the helper to convert CSVs into the five result blocks outlined in the intro:
 
-### 3.1 Telemetry + Scenarios
-
-```powershell
-python results_analysis.py `
-  --telemetry-csv telemetry_lead_vehicle_15mps.csv `
-  --scenario-csv scenarios_lead_vehicle_15mps.csv `
-  --out-dir results_lead_vehicle_15mps `
-  --tag lead_vehicle_15mps
+```bash
+python results_analysis.py \
+  --telemetry-csv logs/telemetry_abs_adaptive.csv \
+  --scenario-csv logs/scenarios_lead_vehicle_15mps.csv \
+  --compare-csv logs/ranges_abs_adaptive.csv \
+  --out-dir results_abs_adaptive \
+  --tag abs_adaptive
 ```
 
-Outputs:
+### 3.1 Telemetry behaviour (Block A)
 
-- `results_lead_vehicle_15mps/lead_vehicle_15mps_speed_brake.png`
-- `results_lead_vehicle_15mps/lead_vehicle_15mps_D_safety.png`
-- `results_lead_vehicle_15mps/lead_vehicle_15mps_tau_dyn.png`
-- Console summary of braking episodes per `scenario`:
-  - mean `v_init_mps`, `s_init_m`, `s_min_m`
-  - mean `t_to_stop_s` (stopped-only)
-  - collision rate
+`results_analysis.py` emits:
 
-### 3.2 Range Comparison
+- `*_speed_gap.png` – `v(t)`, dynamic safety distance, ground-truth headway `x_rel_m`, and the perception-based range estimate.
+- `*_brake_slip.png` – commanded brake, `lambda_max`, and `abs_factor` to illustrate ABS modulation.
+- `*_mu_est.png` – online μ estimate plus the active regime, showing when the adaptive controller retunes its gains.
+- `*_tau_dyn.png` – time headway evolution.
 
-```powershell
-python results_analysis.py `
-  --compare-csv ranges.csv `
-  --out-dir results_ranges `
-  --tag ranges
-```
+Discuss these plots per surface (dry / wet / ice / split-μ) so readers see that the controller maintains safe gaps while ABS modulates slip smoothly.
 
-Outputs:
+### 3.2 Braking performance vs friction (Block B)
+
+The scenario CSV is grouped by μ regime to produce:
+
+- `*_mu_regime_summary.csv` – mean/std/min `range_margin_m`, collision rate, false-stop rate, and `t_to_stop_s` per regime.
+- `*_tts_table.csv` – pivot table of `t_to_stop_s` vs. initial speed bin and μ regime.
+- `*_range_margin_cdf.png` – CDF of range margins (quote 5th/10th percentile to prove safety margins stay positive).
+
+Use these tables to populate the thesis table suggested in §2.5 and to describe how adaptive ABS narrows the variance across μ regimes.
+
+### 3.3 Perception & distance estimation (Block C)
+
+Provide a `--compare-csv` (pinhole vs depth/stereo) or `--stereo-compare-csv` file and the script prints MAE/RMSE by range bin and by class, plus scatter plots saved under `*_range_error_scatter.png`. Quote these numbers when motivating why depth/stereo is required for high-μ braking or long-range gating.
+
+### 3.4 Real-time & latency (Block D)
+
+`summarize_timing()` prints mean/95th/max loop times, detector times, latency, and deadline-miss percentage using the new `loop_ms` instrumentation. `*_loop_ms_hist.png` visualizes the runtime distribution with the 50 Hz target highlighted. Include these numbers in the Results text to prove the stack meets its real-time budget even with ABS and stereo enabled.
+
+### 3.5 False stops & gating robustness (Block E)
+
+- Scenario CSVs now contain a `false_stop` column, so the helper prints false-stop rates per μ regime.
+- Telemetry `false_stop_flag` statistics reveal how often frame-level gating was overly conservative.
+
+Use this block to argue that the new hysteresis/ground-truth checks reduce false positives while keeping the collision rate low.
 
 - `results_ranges/ranges_range_error_scatter.png` – error vs depth distance.
 - Console summary:

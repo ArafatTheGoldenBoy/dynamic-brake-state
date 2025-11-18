@@ -50,8 +50,8 @@ Core script: `dynamic_brake_state.py`
   - Optional OpenCV windows:
     - `DEPTH` pseudo‑color view.
     - `HUD_DIST` text overlay with per‑object X/Y/Z in camera frame.
-  - Telemetry CSV logging (`--telemetry-csv`) with safety envelope and control terms.
-  - Episode‑level scenario CSV logging (`--scenario-csv`) with initial speed/distance, min distance, stop time, and collision flag.
+  - Telemetry CSV logging (`--telemetry-csv`) with safety envelope terms, ABS slip stats, loop/detector timing, ground-truth headway, and false-stop flags.
+  - Episode‑level scenario CSV logging (`--scenario-csv`) with initial headway (estimate + GT), min gap, stop time, collision flag, range/time margins, and ABS duty.
   - Range comparison CSV when `--range-est both` and `--compare-csv` are set.
   - Optional MP4 video recording (`--video-out`) of the front camera feed.
   - On‑demand image snapshots from the front camera by pressing `S`.
@@ -124,7 +124,11 @@ python dynamic_brake_state.py --preset fast --headless --no-opencv
   - Compare braking performance across different `N` using telemetry and scenario CSVs.
 
 - **Offline analysis script**
-  - `results_analysis.py` provides quick plots and summaries for telemetry, scenario, and range comparison CSVs.
+  - `results_analysis.py` now consumes telemetry/scenario/range CSVs and generates:
+    - Telemetry behaviour plots (`*_speed_gap.png`, `*_brake_slip.png`, `*_mu_est.png`, `*_tau_dyn.png`).
+    - μ-regime summary tables, time-to-stop pivot tables, and `*_range_margin_cdf.png` for the braking study.
+    - Loop/detector timing stats plus `*_loop_ms_hist.png` for real-time analysis.
+    - False-stop rates (per scenario and per frame) leveraging the new logging columns.
   - Example:
 
     ```powershell
@@ -195,7 +199,7 @@ For more detailed experiment recipes and thesis‑style result suggestions, see 
 
 ## Thesis Usage
 
-In a research or thesis context, this project is used to quantitatively evaluate a dynamic safety‑envelope‑based braking controller under different sensing and latency conditions in CARLA. The simulator is configured to generate repeatable traffic scenarios with controlled ego speed, road friction, and obstacle placement. For each run, the system logs frame‑level telemetry (vehicle speed, dynamic safety distance, time‑to‑collision surrogate, depth uncertainty, and brake command) as well as episode‑level outcomes (initial speed and distance, minimum distance, stopping time, and collision events) using `--telemetry-csv` and `--scenario-csv`. Additional experiments compare monocular, depth‑camera, and stereo range estimates via `--range-est both --compare-csv`, and emulate slower perception stacks using `--extra-latency-ms`. The accompanying `results_analysis.py` script converts these logs into summary statistics and plots (e.g., braking distance vs. speed, collision rate per scenario, range‑estimation error vs. distance) that can be used directly in the quantitative tables and figures of the thesis Results chapter.
+In a research or thesis context, this project is used to quantitatively evaluate a dynamic safety‑envelope‑based braking controller under different sensing, friction, and latency conditions in CARLA. The simulator is configured to generate repeatable traffic scenarios with controlled ego speed, road friction, and obstacle placement. Each run logs frame‑level telemetry (vehicle speed, safety distance, τ, depth uncertainty, ABS slip metrics, ground-truth headway, loop/detector timing, and false-stop flags) plus episode-level outcomes (initial headway estimate + GT, minimum gap, stopping time, range/time margins, ABS duty, and collision/false-stop status) via `--telemetry-csv` and `--scenario-csv`. Additional experiments compare monocular, depth‑camera, and stereo range estimates via `--range-est both --compare-csv`, and emulate slower perception stacks using `--extra-latency-ms`. The accompanying `results_analysis.py` script turns these logs into telemetry plots, μ-regime tables, margin CDFs, runtime histograms, range-error charts, and false-stop summaries that can be dropped directly into the Results chapter.
 
 ---
 

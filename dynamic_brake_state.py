@@ -101,6 +101,10 @@ FRICTION_CONFIGS = {
     'low':    {'lambda_star': 0.10, 'kp': 3.0, 'ki': 12.0},
 }
 
+# False-stop heuristics for telemetry/episode labeling
+FALSE_STOP_MARGIN_M = 5.0      # if actual gap exceeds safety distance by this margin while braking → suspicious
+FALSE_STOP_TTC_S    = 4.0      # TTC above this while brake engaged → likely false stop
+
 
 def compute_slip_per_wheel(v_ego: float, wheel_speeds: List[float]) -> List[float]:
     """Return longitudinal slip λ for each wheel in [0, 1]."""
@@ -1282,6 +1286,52 @@ class WorldManager:
         except Exception:
             pass
 
+    def lead_distance_ahead(self, lateral_max: float = LATERAL_MAX + 0.5, max_distance: float = 150.0) -> Optional[float]:
+        """Return Euclidean distance to the closest actor ahead of the ego vehicle."""
+
+        try:
+            ego = self.ego
+            if ego is None:
+                return None
+            ego_loc = ego.get_location()
+            ego_rot = ego.get_transform().rotation
+        except Exception:
+            return None
+
+        try:
+            actors = self.world.get_actors()
+        except Exception:
+            return None
+
+        yaw = math.radians(ego_rot.yaw)
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        best = None
+        for actor in actors:
+            try:
+                if actor.id == ego.id:
+                    continue
+                tid = actor.type_id.lower()
+                if not (tid.startswith('vehicle.') or tid.startswith('walker.')):
+                    continue
+                loc = actor.get_location()
+            except Exception:
+                continue
+            dx = loc.x - ego_loc.x
+            dy = loc.y - ego_loc.y
+            longitudinal = dx * cos_yaw + dy * sin_yaw
+            if longitudinal <= 0.0:
+                continue
+            lateral = -dx * sin_yaw + dy * cos_yaw
+            if abs(lateral) > lateral_max:
+                continue
+            dist = math.sqrt(dx*dx + dy*dy)
+            if dist > max_distance:
+                continue
+            if (best is None) or (dist < best):
+                best = dist
+        return best
+
     # ---- NPC helpers ----
     def _spawn_npc_vehicles(self, count: int, autopilot: bool, speed_diff_pct: int):
         bp_lib = self.world.get_blueprint_library()
@@ -1357,13 +1407,18 @@ class _TelemetryLogger:
         self._w = csv.writer(self._csv_f)
         self._w.writerow([
             't','v_mps','tau_dyn','D_safety_dyn','sigma_depth','a_des','brake',
-            'lambda_max','abs_factor','mu_est','mu_regime'
+            'lambda_max','abs_factor','mu_est','mu_regime',
+            'loop_ms','detect_ms','latency_ms','a_meas','x_rel_m','range_est_m',
+            'gate_hit','false_stop_flag'
         ])
 
     def maybe_log(self, t: float, v: float, tau_dyn: Optional[float], D_safety_dyn: Optional[float],
                   sigma_depth: Optional[float], a_des: Optional[float], brake: Optional[float],
                   lambda_max: Optional[float], abs_factor: Optional[float],
-                  mu_est: Optional[float], mu_regime: Optional[str]):
+                  mu_est: Optional[float], mu_regime: Optional[str],
+                  loop_ms: Optional[float], detect_ms: Optional[float], latency_ms: Optional[float],
+                  a_meas: Optional[float], x_rel_m: Optional[float], range_est_m: Optional[float],
+                  gate_hit: Optional[bool], false_stop_flag: Optional[bool]):
         if t - self._last_t >= self.period:
             self._last_t = t
             self._w.writerow([
@@ -1377,6 +1432,14 @@ class _TelemetryLogger:
                 (None if abs_factor is None else float(abs_factor)),
                 (None if mu_est is None else float(mu_est)),
                 mu_regime,
+                (None if loop_ms is None else float(loop_ms)),
+                (None if detect_ms is None else float(detect_ms)),
+                (None if latency_ms is None else float(latency_ms)),
+                (None if a_meas is None else float(a_meas)),
+                (None if x_rel_m is None else float(x_rel_m)),
+                (None if range_est_m is None else float(range_est_m)),
+                (None if gate_hit is None else int(bool(gate_hit))),
+                (None if false_stop_flag is None else int(bool(false_stop_flag))),
             ])
 
     def close(self):
@@ -1401,13 +1464,20 @@ class _ScenarioLogger:
         self._w.writerow([
             'scenario', 'trigger_kind', 'mu',
             'v_init_mps', 's_init_m', 's_min_m',
-            'stopped', 't_to_stop_s', 'collision'
+            's_init_gt_m', 's_min_gt_m',
+            'stopped', 't_to_stop_s', 'collision',
+            'range_margin_m', 'tts_margin_s',
+            'max_lambda', 'mean_abs_factor', 'false_stop'
         ])
         self._f.flush()
 
     def log(self, scenario: str, trigger_kind: str, mu: float,
             v_init: float, s_init: float, s_min: float,
-            stopped: bool, t_to_stop: float, collision: bool):
+            s_init_gt: Optional[float], s_min_gt: Optional[float],
+            stopped: bool, t_to_stop: float, collision: bool,
+            range_margin: Optional[float], tts_margin: Optional[float],
+            max_lambda: Optional[float], mean_abs_factor: Optional[float],
+            false_stop: bool):
         self._w.writerow([
             scenario,
             trigger_kind,
@@ -1415,9 +1485,16 @@ class _ScenarioLogger:
             float(v_init),
             float(s_init),
             float(s_min),
+            (None if s_init_gt is None else float(s_init_gt)),
+            (None if s_min_gt is None else float(s_min_gt)),
             bool(stopped),
             float(t_to_stop),
             bool(collision),
+            (None if range_margin is None else float(range_margin)),
+            (None if tts_margin is None else float(tts_margin)),
+            (None if max_lambda is None else float(max_lambda)),
+            (None if mean_abs_factor is None else float(mean_abs_factor)),
+            bool(false_stop),
         ])
         self._f.flush()
 
@@ -1889,7 +1966,7 @@ class App:
         D_safety_dyn = D_MIN + K_LAT_D*(v*latency_s) + K_UNC_D*sigma_depth + K_MU_D*mu_short
         D_safety_dyn = self._D_safety_dyn_prev + max(-1.0, min(1.0, D_safety_dyn - self._D_safety_dyn_prev))
         self._D_safety_dyn_prev = D_safety_dyn
-        return tau_dyn, D_safety_dyn, sigma_depth
+        return tau_dyn, D_safety_dyn, sigma_depth, latency_s
 
     # --- Control step: throttle/brake/hold ---
     def _control_step(self,
@@ -1951,11 +2028,12 @@ class App:
 
         dbg = {'tau_dyn': None, 'D_safety_dyn': None, 'sigma_depth': None, 'gate_hit': False,
                'a_des': None, 'brake': None, 'brake_active': in_brake_band,
-               'brake_reason': brake_reason, 'brake_target_dist': nearest_s_active}
+               'brake_reason': brake_reason, 'brake_target_dist': nearest_s_active,
+               'latency_s': None}
 
         if in_brake_band and (nearest_s_active is not None):
             s_used = 0.7 * (last_s0 if last_s0 is not None else nearest_s_active) + 0.3 * nearest_s_active
-            tau_dyn, D_safety_dyn, sigma_depth = self._safety_envelope(v, MU, ema_loop_ms, nearest_box, nearest_conf, depth_m, depth_stereo_m)
+            tau_dyn, D_safety_dyn, sigma_depth, latency_s = self._safety_envelope(v, MU, ema_loop_ms, nearest_box, nearest_conf, depth_m, depth_stereo_m)
             required_dist_physics = (v*v)/(2.0*max(1e-3, A_MU)) + v*tau_dyn + D_safety_dyn
             gate_hit = (required_dist_physics >= s_used)
 
@@ -1988,6 +2066,7 @@ class App:
             dbg.update({'tau_dyn': tau_dyn, 'D_safety_dyn': D_safety_dyn, 'sigma_depth': sigma_depth,
                         'gate_hit': gate_hit, 'a_des': a_des, 'brake': brake,
                         'brake_reason': brake_reason, 'brake_target_dist': nearest_s_active,
+                        'latency_s': latency_s,
                         'brake_active': True})
 
         elif hold_blocked:
@@ -2189,6 +2268,12 @@ class App:
         episode_v_init = 0.0
         episode_s_init = 0.0
         episode_s_min = float('inf')
+        episode_s_init_gt = float('nan')
+        episode_s_min_gt = float('inf')
+        episode_lambda_max = 0.0
+        episode_abs_factor_sum = 0.0
+        episode_abs_factor_count = 0
+        episode_false_flag = False
         episode_t_start = 0.0
         if not hasattr(self, '_prev_brake_activation'):
             self._prev_brake_activation = False
@@ -2238,7 +2323,10 @@ class App:
                     vis8 = cv2.applyColorMap(vis8, cv2.COLORMAP_PLASMA)
                     cv2.imshow('DEPTH', vis8)
                 # Perception step (YOLO + depth/stereo + gating)
+                detect_ms = None
+                detect_t0 = time.time()
                 perc = self._perception_step(bgr, depth_m, depth_stereo_m, FX_, FY_, CX_, CY_, sim_time, v, MU, log_both, csv_w)
+                detect_ms = (time.time() - detect_t0) * 1000.0
                 bgr = perc['bgr']
                 det_points = perc['det_points']
                 nearest_s_active = perc['nearest_s_active']
@@ -2251,6 +2339,13 @@ class App:
                 tl_det_box = perc['tl_det_box']
                 stop_detected_current = perc['stop_detected_current']
                 any_red_tl = (tl_state == 'RED')
+
+                x_rel_gt = None
+                if self.world is not None:
+                    try:
+                        x_rel_gt = self.world.lead_distance_ahead()
+                    except Exception:
+                        x_rel_gt = None
 
                 if any_red_tl and (tl_s_active is not None):
                     if (nearest_s_active is None) or (tl_s_active < nearest_s_active):
@@ -2352,6 +2447,8 @@ class App:
                 brake_active = bool(dbg_map.get('brake_active'))
                 brake_reason = dbg_map.get('brake_reason')
                 brake_target = dbg_map.get('brake_target_dist')
+                dbg_latency_s = dbg_map.get('latency_s')
+                dbg_latency_ms = None if (dbg_latency_s is None) else (float(dbg_latency_s) * 1000.0)
                 if (not brake_reason) and hold_blocked and hold_reason in ('stop_sign','red_light','obstacle'):
                     brake_reason = hold_reason
                 current_dist = None
@@ -2366,6 +2463,25 @@ class App:
                         continue
                     current_dist = val
                     break
+
+                range_est = current_dist
+                false_stop_flag = False
+                if brake_active:
+                    gate_state = bool(dbg_gate_hit)
+                    if x_rel_gt is None or not math.isfinite(x_rel_gt):
+                        false_stop_flag = True
+                    else:
+                        if not gate_state:
+                            if dbg_D_safety_dyn is not None and math.isfinite(dbg_D_safety_dyn):
+                                margin_val = x_rel_gt - dbg_D_safety_dyn
+                                if margin_val > FALSE_STOP_MARGIN_M:
+                                    false_stop_flag = True
+                            if v > 0.1:
+                                ttc = x_rel_gt / max(v, 0.1)
+                                if ttc > FALSE_STOP_TTC_S:
+                                    false_stop_flag = True
+                else:
+                    false_stop_flag = False
 
                 # --- Episode bookkeeping: start/end of braking events ---
                 reason_allowed = brake_reason in ('obstacle','stop_sign','red_light')
@@ -2391,10 +2507,25 @@ class App:
                     episode_v_init = v
                     episode_s_init = float(start_dist)
                     episode_s_min = float(start_dist)
+                    episode_s_init_gt = float(x_rel_gt) if (x_rel_gt is not None and math.isfinite(x_rel_gt)) else float(start_dist)
+                    episode_s_min_gt = float(episode_s_init_gt)
+                    episode_lambda_max = abs_lambda if (abs_lambda is not None) else 0.0
+                    episode_abs_factor_sum = 0.0
+                    episode_abs_factor_count = 0
+                    episode_false_flag = False
                     episode_t_start = sim_time
                 elif episode_active:
                     if current_dist is not None:
                         episode_s_min = min(episode_s_min, current_dist)
+                    if x_rel_gt is not None and math.isfinite(x_rel_gt):
+                        episode_s_min_gt = min(episode_s_min_gt, x_rel_gt)
+                    if abs_lambda is not None:
+                        episode_lambda_max = max(episode_lambda_max, abs_lambda)
+                    if abs_factor is not None:
+                        episode_abs_factor_sum += abs_factor
+                        episode_abs_factor_count += 1
+                    if false_stop_flag:
+                        episode_false_flag = True
                     still_active = activation
                     # Episode considered finished once vehicle has effectively stopped
                     # or braking band / hold is released (returned to cruising).
@@ -2403,22 +2534,53 @@ class App:
                         t_to_stop = max(0.0, sim_time - episode_t_start)
                         if self.scenario_logger is not None:
                             try:
+                                s_init_logged = episode_s_init
+                                s_min_logged = episode_s_min if math.isfinite(episode_s_min) else episode_s_init
+                                s_init_gt_logged = episode_s_init_gt if math.isfinite(episode_s_init_gt) else None
+                                s_min_gt_logged = episode_s_min_gt if math.isfinite(episode_s_min_gt) else None
+                                if (s_init_gt_logged is not None) and (s_min_gt_logged is not None):
+                                    range_margin = s_init_gt_logged - s_min_gt_logged
+                                elif math.isfinite(s_init_logged) and math.isfinite(s_min_logged):
+                                    range_margin = s_init_logged - s_min_logged
+                                else:
+                                    range_margin = None
+                                tts_margin = None
+                                if stopped:
+                                    theoretical = episode_v_init / max(0.1, MU * 9.81)
+                                    tts_margin = t_to_stop - theoretical
+                                max_lambda_val = episode_lambda_max if episode_lambda_max > 0 else None
+                                mean_abs_factor = None
+                                if episode_abs_factor_count > 0:
+                                    mean_abs_factor = episode_abs_factor_sum / episode_abs_factor_count
+                                collision_state = bool(self.world.collision_happened if self.world is not None else False)
+                                false_stop_episode = bool(episode_false_flag or ((not collision_state) and (range_margin is not None) and (range_margin > FALSE_STOP_MARGIN_M)))
                                 self.scenario_logger.log(
                                     getattr(self.args, 'scenario_tag', 'default'),
                                     str(episode_trigger or 'unknown'),
                                     MU,
                                     episode_v_init,
-                                    episode_s_init,
-                                    episode_s_min if math.isfinite(episode_s_min) else episode_s_init,
+                                    s_init_logged,
+                                    s_min_logged,
+                                    s_init_gt_logged,
+                                    s_min_gt_logged,
                                     bool(stopped),
                                     t_to_stop,
-                                    bool(self.world.collision_happened if self.world is not None else False),
+                                    collision_state,
+                                    range_margin,
+                                    tts_margin,
+                                    max_lambda_val,
+                                    mean_abs_factor,
+                                    false_stop_episode,
                                 )
                             except Exception:
                                 pass
                         episode_active = False
                         episode_trigger = None
                         self._collision_logged_count = getattr(self, '_collision_logged_count', 0)
+                        episode_lambda_max = 0.0
+                        episode_abs_factor_sum = 0.0
+                        episode_abs_factor_count = 0
+                        episode_false_flag = False
 
                 self._prev_brake_activation = activation
 
@@ -2526,7 +2688,10 @@ class App:
                     try:
                         self.telemetry.maybe_log(sim_time, v, dbg_tau_dyn, dbg_D_safety_dyn, dbg_sigma_depth,
                                                  dbg_a_des, dbg_brake,
-                                                 dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime)
+                                                 dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime,
+                                                 loop_ms, detect_ms, dbg_latency_ms,
+                                                 a_long, x_rel_gt, range_est,
+                                                 dbg_gate_hit, false_stop_flag)
                     except Exception:
                         pass
                 clock.tick(int(1.0/DT))
