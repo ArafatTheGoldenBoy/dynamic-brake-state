@@ -15,8 +15,11 @@ def load_telemetry(path: Path) -> pd.DataFrame:
     numeric_cols = [
         "t", "v_mps", "tau_dyn", "D_safety_dyn", "sigma_depth", "a_des", "brake",
         "lambda_max", "abs_factor", "mu_est", "loop_ms", "loop_ms_max", "detect_ms",
-        "latency_ms", "a_meas", "x_rel_m", "range_est_m", "gate_hit", "false_stop_flag",
-        "ttc_s", "sensor_to_control_ms", "control_to_act_ms", "sensor_to_act_ms"
+        "latency_ms", "a_meas", "x_rel_m", "range_est_m", "gate_hit", "gate_confirmed",
+        "false_stop_flag", "ttc_s", "brake_stage", "brake_stage_factor", "tracker_s_m",
+        "tracker_rate_mps", "lead_track_id", "active_track_count", "sensor_ts",
+        "control_ts", "sensor_to_control_ms", "actuation_ts", "control_to_act_ms",
+        "sensor_to_act_ms"
     ]
     for col in numeric_cols:
         if col in df.columns:
@@ -28,7 +31,8 @@ def load_scenarios(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     numeric_cols = [
         "mu", "v_init_mps", "s_init_m", "s_min_m", "s_init_gt_m", "s_min_gt_m",
-        "t_to_stop_s", "range_margin_m", "tts_margin_s", "max_lambda", "mean_abs_factor"
+        "t_to_stop_s", "range_margin_m", "tts_margin_s", "ttc_init_s", "ttc_min_s",
+        "reaction_time_s", "max_lambda", "mean_abs_factor"
     ]
     for col in numeric_cols:
         if col in df.columns:
