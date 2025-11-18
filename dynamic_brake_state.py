@@ -64,6 +64,15 @@ V_STOP            = 0.10
 V_AEB_MIN_DEFAULT = 2.5               # minimum speed for obstacle-triggered AEB
 GATE_CONFIRM_FRAMES_DEFAULT = 3       # frames of gate_hit before AEB entry
 TTC_CONFIRM_S_DEFAULT = 2.5           # TTC threshold for obstacle confirmation
+TTC_STAGE_STRONG_DEFAULT = 1.8        # TTC where controller escalates to strong braking
+TTC_STAGE_FULL_DEFAULT   = 1.0        # TTC where controller escalates to full AEB
+
+# Multi-stage AEB shaping (fraction of μg cap)
+BRAKE_STAGE_COMFORT_FACTOR = 0.45
+BRAKE_STAGE_STRONG_FACTOR  = 0.75
+BRAKE_STAGE_FULL_FACTOR    = 1.00
+AEB_RAMP_UP_DEFAULT        = 12.0     # max increase in a_des (m/s^2) per second
+AEB_RAMP_DOWN_DEFAULT      = 18.0     # max decrease in a_des (m/s^2) per second
 
 # Clear timers (per reason)
 CLEAR_DELAY_OBS   = 0.9               # obstacle clear debounce
@@ -1678,7 +1687,7 @@ class _TelemetryLogger:
             't','v_mps','tau_dyn','D_safety_dyn','sigma_depth','a_des','brake',
             'lambda_max','abs_factor','mu_est','mu_regime',
             'loop_ms','loop_ms_max','detect_ms','latency_ms','a_meas','x_rel_m','range_est_m',
-            'ttc_s','gate_hit','gate_confirmed','false_stop_flag',
+            'ttc_s','gate_hit','gate_confirmed','false_stop_flag','brake_stage','brake_stage_factor',
             'tracker_s_m','tracker_rate_mps','lead_track_id','active_track_count',
             'sensor_ts','control_ts','sensor_to_control_ms',
             'actuation_ts','control_to_act_ms','sensor_to_act_ms'
@@ -1694,6 +1703,7 @@ class _TelemetryLogger:
                   ttc_s: Optional[float],
                   gate_hit: Optional[bool], gate_confirmed: Optional[bool],
                   false_stop_flag: Optional[bool],
+                  brake_stage: Optional[int], brake_stage_factor: Optional[float],
                   tracker_s: Optional[float], tracker_rate: Optional[float],
                   tracker_id: Optional[int], tracker_count: Optional[int],
                   sensor_ts: Optional[float], control_ts: Optional[float],
@@ -1725,6 +1735,8 @@ class _TelemetryLogger:
                 (None if gate_hit is None else int(bool(gate_hit))),
                 (None if gate_confirmed is None else int(bool(gate_confirmed))),
                 (None if false_stop_flag is None else int(bool(false_stop_flag))),
+                (None if brake_stage is None else int(brake_stage)),
+                (None if brake_stage_factor is None else float(brake_stage_factor)),
                 (None if tracker_s is None else float(tracker_s)),
                 (None if tracker_rate is None else float(tracker_rate)),
                 (None if tracker_id is None else int(tracker_id)),
@@ -1892,9 +1904,42 @@ class App:
             self.ttc_confirm_s = max(0.5, float(getattr(self.args, 'ttc_confirm_s', TTC_CONFIRM_S_DEFAULT)))
         except Exception:
             self.ttc_confirm_s = TTC_CONFIRM_S_DEFAULT
+        try:
+            self.ttc_stage_strong = max(0.1, float(getattr(self.args, 'ttc_stage_strong', TTC_STAGE_STRONG_DEFAULT)))
+        except Exception:
+            self.ttc_stage_strong = TTC_STAGE_STRONG_DEFAULT
+        try:
+            self.ttc_stage_full = max(0.05, float(getattr(self.args, 'ttc_stage_full', TTC_STAGE_FULL_DEFAULT)))
+        except Exception:
+            self.ttc_stage_full = TTC_STAGE_FULL_DEFAULT
+        # Ensure ordering: full < strong <= confirm
+        if self.ttc_stage_strong <= self.ttc_stage_full:
+            self.ttc_stage_strong = self.ttc_stage_full + 0.05
+        self.ttc_stage_strong = min(self.ttc_confirm_s, self.ttc_stage_strong)
+        if self.ttc_stage_full >= self.ttc_stage_strong:
+            self.ttc_stage_full = max(0.1, self.ttc_stage_strong - 0.05)
+        try:
+            self.stage_factor_comfort = max(0.1, min(0.95, float(getattr(self.args, 'aeb_stage_comfort', BRAKE_STAGE_COMFORT_FACTOR))))
+        except Exception:
+            self.stage_factor_comfort = BRAKE_STAGE_COMFORT_FACTOR
+        try:
+            self.stage_factor_strong = max(self.stage_factor_comfort + 0.01,
+                                           min(0.99, float(getattr(self.args, 'aeb_stage_strong', BRAKE_STAGE_STRONG_FACTOR))))
+        except Exception:
+            self.stage_factor_strong = BRAKE_STAGE_STRONG_FACTOR
+        self.stage_factor_full = BRAKE_STAGE_FULL_FACTOR
+        try:
+            self.aeb_ramp_up = max(0.5, float(getattr(self.args, 'aeb_ramp_up', AEB_RAMP_UP_DEFAULT)))
+        except Exception:
+            self.aeb_ramp_up = AEB_RAMP_UP_DEFAULT
+        try:
+            self.aeb_ramp_down = max(0.5, float(getattr(self.args, 'aeb_ramp_down', AEB_RAMP_DOWN_DEFAULT)))
+        except Exception:
+            self.aeb_ramp_down = AEB_RAMP_DOWN_DEFAULT
 
         self._gate_confirm_counter = 0
         self._hazard_confirm_since = -1.0
+        self._aeb_a_des = 0.0
 
     def _draw_hud(self, screen, bgr, img_top, perf_fps, perf_ms, x, y, z, yaw, compass,
                    frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
@@ -2337,12 +2382,15 @@ class App:
         required_dist_physics = None
         gate_hit = False
         tracked_rate = getattr(self, '_tracked_rate', None)
+        s_eff = None
         if (nearest_s_active is not None) or (last_s0 is not None):
             s_used = last_s0 if last_s0 is not None else nearest_s_active
             tau_dyn, D_safety_dyn, sigma_depth, latency_s = self._safety_envelope(
                 v, MU, ema_loop_ms, nearest_box, nearest_conf, depth_m, depth_stereo_m)
             required_dist_physics = (v*v)/(2.0*max(1e-3, A_MU)) + v*tau_dyn + D_safety_dyn
             gate_hit = (required_dist_physics >= s_used)
+            if (tau_dyn is not None) and (D_safety_dyn is not None) and (s_used is not None):
+                s_eff = max(EPS, s_used - D_safety_dyn - v * tau_dyn)
 
         ttc = None
         if s_used is not None:
@@ -2397,29 +2445,59 @@ class App:
 
         in_brake_band = object_ready or reason_stop or reason_red
 
+        brake_stage = 0
+        stage_factor = 0.0
+        if in_brake_band:
+            if (ttc is None) or (ttc > self.ttc_stage_strong):
+                brake_stage = 1
+            if (ttc is not None) and (ttc <= self.ttc_stage_strong):
+                brake_stage = 2
+            if (ttc is not None) and (ttc <= self.ttc_stage_full):
+                brake_stage = 3
+            if reason_stop or reason_red:
+                brake_stage = max(1, brake_stage)
+            stage_map = {
+                1: self.stage_factor_comfort,
+                2: self.stage_factor_strong,
+                3: self.stage_factor_full,
+            }
+            stage_factor = stage_map.get(brake_stage, 0.0)
+
         dbg_target = s_used if s_used is not None else nearest_s_active
         dbg = {'tau_dyn': tau_dyn, 'D_safety_dyn': D_safety_dyn, 'sigma_depth': sigma_depth, 'gate_hit': gate_hit,
                'a_des': None, 'brake': None, 'brake_active': in_brake_band,
-               'brake_reason': brake_reason, 'brake_target_dist': dbg_target,
-               'latency_s': latency_s, 'ttc': ttc, 'gate_confirmed': gate_confirmed}
+                'brake_reason': brake_reason, 'brake_target_dist': dbg_target,
+               'latency_s': latency_s, 'ttc': ttc, 'gate_confirmed': gate_confirmed,
+               'brake_stage': brake_stage, 'brake_stage_factor': stage_factor}
 
-        if in_brake_band and (nearest_s_active is not None) and (tau_dyn is not None) and (D_safety_dyn is not None):
-            if gate_hit:
-                a_des = A_MU
-                brake_ff = min(1.0, a_des / A_MAX)
-                a_meas = 0.0 if v_prev is None else max(0.0, (v_prev - v) / DT)
-                e = max(0.0, a_des - a_meas)
-                I_err = max(-I_MAX, min(I_MAX, I_err + e*DT))
-                brake = max(0.0, min(1.0, brake_ff + (KPB*e + KIB*I_err)/A_MAX))
+        if in_brake_band and (s_used is not None) and (tau_dyn is not None) and (D_safety_dyn is not None):
+            a_candidate = None
+            if not gate_hit and s_eff is not None:
+                a_candidate = min(A_MAX, (v*v) / (2.0 * max(EPS, s_eff)))
+                a_candidate = min(a_candidate, A_MU)
+            if a_candidate is None:
+                a_candidate = A_MU if gate_hit else min(A_MU, A_MAX)
+            stage_limit = None
+            if brake_stage == 1:
+                stage_limit = self.stage_factor_comfort * A_MU
+            elif brake_stage == 2:
+                stage_limit = self.stage_factor_strong * A_MU
+            elif brake_stage >= 3:
+                stage_limit = self.stage_factor_full * A_MU
+            a_target = a_candidate if stage_limit is None else min(a_candidate, stage_limit)
+            prev_a = getattr(self, '_aeb_a_des', 0.0)
+            ramp_up = self.aeb_ramp_up * DT
+            ramp_down = self.aeb_ramp_down * DT
+            if a_target > prev_a:
+                a_des = min(a_target, prev_a + ramp_up)
             else:
-                s_eff = max(s_used - D_safety_dyn - v*tau_dyn, EPS)
-                a_des = min((v*v) / (2.0 * s_eff), A_MAX)
-                a_des = min(a_des, A_MU)
-                brake_ff = max(0.0, min(1.0, a_des / A_MAX))
-                a_meas = 0.0 if v_prev is None else max(0.0, (v_prev - v) / DT)
-                e = max(0.0, a_des - a_meas)
-                I_err = max(-I_MAX, min(I_MAX, I_err + e*DT))
-                brake = max(0.0, min(1.0, brake_ff + (KPB*e + KIB*I_err)/A_MAX))
+                a_des = max(a_target, prev_a - ramp_down)
+            self._aeb_a_des = a_des
+            brake_ff = max(0.0, min(1.0, a_des / A_MAX))
+            a_meas = 0.0 if v_prev is None else max(0.0, (v_prev - v) / DT)
+            e = max(0.0, a_des - a_meas)
+            I_err = max(-I_MAX, min(I_MAX, I_err + e*DT))
+            brake = max(0.0, min(1.0, brake_ff + (KPB*e + KIB*I_err)/A_MAX))
 
             if v < V_STOP:
                 hold_blocked = True
@@ -2436,6 +2514,9 @@ class App:
                         'latency_s': latency_s,
                         'ttc': ttc,
                         'gate_confirmed': gate_confirmed,
+                        'brake_stage': brake_stage,
+                        'brake_stage_factor': stage_factor,
+                        'a_des_target': a_target,
                         'brake_active': True})
 
         elif hold_blocked:
@@ -2454,6 +2535,7 @@ class App:
                 hold_blocked = False; hold_reason = None; last_s0 = None
                 if hasattr(self, '_lead_tracker') and self._lead_tracker is not None:
                     self._lead_tracker.deactivate()
+                self._aeb_a_des = 0.0
                 throttle, brake = 0.0, 0.0
                 self._kick_until = self._sim_time + KICK_SEC
                 stop_release_ignore_until = self._sim_time + 2.0
@@ -2463,6 +2545,7 @@ class App:
             e_v = v_target - v
             throttle = max(0.0, min(1.0, KP_THROTTLE * e_v))
             brake = 0.0
+            self._aeb_a_des = 0.0
             if self._sim_time < getattr(self, '_kick_until', 0.0) and v < 0.3:
                 throttle = max(throttle, KICK_THR)
             if not hold_blocked and v < 0.25:
@@ -2882,6 +2965,8 @@ class App:
                 dbg_a_des = dbg_map.get('a_des')
                 dbg_brake = dbg_map.get('brake')
                 dbg_ttc = dbg_map.get('ttc')
+                dbg_brake_stage = dbg_map.get('brake_stage')
+                dbg_brake_stage_factor = dbg_map.get('brake_stage_factor')
                 dbg_abs_lambda = dbg_map.get('abs_lambda_max')
                 dbg_abs_factor = dbg_map.get('abs_factor')
                 dbg_abs_mu = dbg_map.get('abs_mu')
@@ -3195,6 +3280,7 @@ class App:
                                                  dbg_ttc,
                                                  dbg_gate_hit, dbg_gate_confirmed,
                                                  false_stop_flag,
+                                                 dbg_brake_stage, dbg_brake_stage_factor,
                                                  tracker_distance_logged, tracker_rate_logged,
                                                  tracker_id_logged, tracker_count_logged,
                                                  sensor_timestamp, control_timestamp,
@@ -3273,6 +3359,18 @@ def parse_args():
                         help='Consecutive gate-hit frames required before obstacle braking is allowed')
     parser.add_argument('--ttc-confirm-s', type=float, default=TTC_CONFIRM_S_DEFAULT,
                         help='TTC threshold (seconds) that must be met before obstacle braking is allowed')
+    parser.add_argument('--ttc-stage-strong', type=float, default=TTC_STAGE_STRONG_DEFAULT,
+                        help='TTC threshold (seconds) to escalate from comfort to strong braking once confirmed')
+    parser.add_argument('--ttc-stage-full', type=float, default=TTC_STAGE_FULL_DEFAULT,
+                        help='TTC threshold (seconds) to escalate from strong to full AEB braking')
+    parser.add_argument('--aeb-stage-comfort', type=float, default=BRAKE_STAGE_COMFORT_FACTOR,
+                        help='Fraction of μg to request during the comfort braking stage (0..1)')
+    parser.add_argument('--aeb-stage-strong', type=float, default=BRAKE_STAGE_STRONG_FACTOR,
+                        help='Fraction of μg to request during the strong braking stage (0..1)')
+    parser.add_argument('--aeb-ramp-up', type=float, default=AEB_RAMP_UP_DEFAULT,
+                        help='Max increase rate for a_des (m/s^2 per second) when escalating braking')
+    parser.add_argument('--aeb-ramp-down', type=float, default=AEB_RAMP_DOWN_DEFAULT,
+                        help='Max decrease rate for a_des (m/s^2 per second) when relaxing braking')
     parser.add_argument('--range-est', type=str, default='pinhole',
                         choices=['pinhole', 'depth', 'stereo', 'both'],
                         help='Distance source: monocular pinhole, CARLA depth, stereo vision, or log both (depth vs pinhole)')

@@ -100,7 +100,8 @@ python dynamic_brake_state.py --range-est both --compare-csv ranges.csv --yolo-c
 
 # High quality run with telemetry logging + TTC/persistence tuning
 python dynamic_brake_state.py --preset quality --telemetry-csv telem.csv --telemetry-hz 20 \
-  --gate-confirm-frames 4 --ttc-confirm-s 2.0 --min-aeb-speed 4.0
+  --gate-confirm-frames 4 --ttc-confirm-s 2.0 --min-aeb-speed 4.0 \
+  --ttc-stage-strong 1.6 --ttc-stage-full 0.9 --aeb-stage-comfort 0.4 --aeb-stage-strong 0.7
 ```
 
 For non-visual / CI-style runs:
@@ -114,6 +115,12 @@ If you need tighter or looser AEB sensitivity, tune:
 - `--min-aeb-speed` – minimum ego speed (m/s) required before automatic braking is allowed.
 - `--gate-confirm-frames` – consecutive frames that must hit the safety gate before braking starts.
 - `--ttc-confirm-s` – minimum (low) TTC duration that must persist before AEB is confirmed.
+- `--ttc-stage-strong` / `--ttc-stage-full` – TTC bands (s) for escalating from comfort → strong → full AEB.
+- `--aeb-stage-comfort` / `--aeb-stage-strong` – μg fractions per stage (full stage is fixed at 1.0).
+- `--aeb-ramp-up` / `--aeb-ramp-down` – rate limits (m/s² per second) on how quickly a_des can change.
+
+The controller now runs a three-stage AEB sequence (comfort → strong → full) where TTC thresholds decide when to escalate and
+`a_des` is ramped by the jerk caps above instead of instantly jumping to μg.
 
 These knobs feed into the hazard-confirm timer so the telemetry/scenario CSVs now include TTC and reaction-time metrics you can cite in a thesis.
 
@@ -131,7 +138,7 @@ These knobs feed into the hazard-confirm timer so the telemetry/scenario CSVs no
 
 ### Logged metrics (CSV columns)
 
-- **Telemetry (`--telemetry-csv`)**: `t`, `v_mps`, `tau_dyn`, `D_safety_dyn`, `sigma_depth`, `a_des`, `brake`, `lambda_max`, `abs_factor`, `mu_est`, `mu_regime`, `loop_ms`, `loop_ms_max`, `detect_ms`, `latency_ms`, `a_meas`, `x_rel_m`, `range_est_m`, `ttc_s`, `gate_hit`, `gate_confirmed`, `false_stop_flag`, `tracker_s_m`, `tracker_rate_mps`, `lead_track_id`, `active_track_count`, `sensor_ts`, `control_ts`, `sensor_to_control_ms`, `actuation_ts`, `control_to_act_ms`, `sensor_to_act_ms`.
+- **Telemetry (`--telemetry-csv`)**: `t`, `v_mps`, `tau_dyn`, `D_safety_dyn`, `sigma_depth`, `a_des`, `brake`, `lambda_max`, `abs_factor`, `mu_est`, `mu_regime`, `loop_ms`, `loop_ms_max`, `detect_ms`, `latency_ms`, `a_meas`, `x_rel_m`, `range_est_m`, `ttc_s`, `gate_hit`, `gate_confirmed`, `false_stop_flag`, `brake_stage`, `brake_stage_factor`, `tracker_s_m`, `tracker_rate_mps`, `lead_track_id`, `active_track_count`, `sensor_ts`, `control_ts`, `sensor_to_control_ms`, `actuation_ts`, `control_to_act_ms`, `sensor_to_act_ms`.
 - **Braking episodes (`--scenario-csv`)**: `scenario`, `trigger_kind`, `mu`, `v_init_mps`, `s_init_m`, `s_min_m`, `s_init_gt_m`, `s_min_gt_m`, `stopped`, `t_to_stop_s`, `collision`, `range_margin_m`, `tts_margin_s`, `ttc_init_s`, `ttc_min_s`, `reaction_time_s`, `max_lambda`, `mean_abs_factor`, `false_stop`.
 - **Range comparison (`--range-est both --compare-csv`)**: raw detections with pinhole vs depth distances plus per-class errors, μ, ego speed, and depth-uncertainty snapshots.
 - **Stereo comparison (`--stereo-compare-csv`)**: disparity-based vs depth-camera ground-truth to quantify stereo bias.
