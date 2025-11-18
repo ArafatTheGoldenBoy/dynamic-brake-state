@@ -201,6 +201,11 @@ Repeat the command per scenario/tag; the script writes PNGs and CSV summary tabl
 | False-stop auditing | Document failure cases | Use telemetry `false_stop_flag` and scenario `false_stop` columns; capture qualitative frames with `S`/`--video-out`. |
 | ABS/slip control | Compare `--abs-mode off|fixed|adaptive` | Log `lambda_max`, `abs_factor`, `mu_est`, plus `t_to_stop_s` from scenario CSVs. |
 
+### Open items & terminology
+
+- **Persistent object tracking** – `_control_step()` currently selects the obstacle that is nearest in the *current* frame and only smooths its distance via a single-pole EMA (`s_used = 0.7·last_s0 + 0.3·nearest_s_active`). There is no notion of a track ID, IoU-based association, or per-object life cycle, so the braking target can change whenever detections flicker. Closing this gap would involve keeping a persistent track (ID, distance, velocity) across frames and only switching to a new obstacle after multi-frame confirmation/hysteresis.
+- **True measured sensor-to-actuator delay** – `_safety_envelope()` derives `latency_s = max(DT, (ema_loop_ms + extra_ms)/1000.0) + 0.03`, which is an estimate based on observed loop timing plus a fixed pad. This number is logged in telemetry, but it is *not* a direct measurement of “camera frame timestamp minus brake command timestamp.” To publish true sensor-to-actuator latency you would need to record precise timestamps for (a) when CARLA delivers each sensor frame, (b) when the controller issues a non-zero brake command, and ideally (c) when the vehicle dynamics reflect that command, then log their differences. Until that instrumentation exists, describe the logged latency as an estimate, not an empirical measurement.
+
 ### ABS actuator experiments (summary)
 
 - Switch controller modes with `--abs-mode off|fixed|adaptive`; keep `--apply-tire-friction` enabled so CARLA tire friction matches the requested μ.
