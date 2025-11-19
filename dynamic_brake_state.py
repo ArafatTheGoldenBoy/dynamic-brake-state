@@ -2101,6 +2101,8 @@ class App:
                    stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
                    dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target,
                    collision_flag: bool,
+                   det_points: Optional[List[Dict[str, Any]]] = None,
+                   range_mode_label: Optional[str] = None,
                    abs_lambda: Optional[float] = None,
                    abs_factor: Optional[float] = None,
                    abs_mu: Optional[float] = None,
@@ -2132,6 +2134,23 @@ class App:
             shadow(screen,
                    f'ABS slip={slip_txt}  f={fac_txt}  mu_est={mu_txt}  regime={regime_txt}',
                    (10, IMG_H-46), (180,255,255))
+        log_y = 10
+        log_x = 10
+        mode_label = range_mode_label or 'range'
+        shadow(screen, f'Ego→Object distances ({mode_label}, meters):', (log_x, log_y), (0, 255, 255))
+        log_y += 22
+        det_points_sorted: List[Dict[str, Any]] = []
+        if det_points:
+            det_points_sorted = sorted(det_points, key=lambda d: d.get('z', float('inf')))
+        if det_points_sorted:
+            for d in det_points_sorted[:22]:
+                xcam, ycam, zcam = d['xyz']
+                shadow(screen,
+                       f"{d['name']:<14}  Z={zcam:5.1f} m   X={xcam:+4.1f} m   Y={ycam:+4.1f} m",
+                       (log_x, log_y), (180, 255, 180))
+                log_y += 18
+        else:
+            shadow(screen, 'No detections', (log_x, log_y), (180, 180, 180))
         if collision_flag:
             shadow(screen, '*** COLLISION DETECTED ***', (IMG_W//4, IMG_H//2), (255,40,40))
         pygame.display.flip()
@@ -2931,16 +2950,6 @@ class App:
             WIN_W, WIN_H = IMG_W * win_cols, IMG_H
             self.screen = pygame.display.set_mode((WIN_W, WIN_H))
             pygame.display.set_caption('Nearestfirst + TL/StopSign | YOLO12n | Sync (OOP)')
-        if not getattr(self.args, 'no_opencv', False) and not self.headless:
-            try:
-                cv2.namedWindow('DEPTH', cv2.WINDOW_NORMAL)
-                cv2.resizeWindow('DEPTH', IMG_W, IMG_H)
-                cv2.moveWindow('DEPTH', 960, 540)
-                cv2.namedWindow('HUD_DIST', cv2.WINDOW_NORMAL)
-                cv2.resizeWindow('HUD_DIST', IMG_W, IMG_H)
-                cv2.moveWindow('HUD_DIST', 0, 540)
-            except Exception:
-                pass
 
     def _close_windows(self):
         try:
@@ -2985,8 +2994,7 @@ class App:
         try:
             print(
                 f"Views: top={'ON' if not getattr(self.args, 'no_top_cam', False) else 'OFF'} "
-                f"depth={'ON' if not getattr(self.args, 'no_depth_cam', False) else 'OFF'} "
-                f"opencv={'ON' if not getattr(self.args, 'no_opencv', False) else 'OFF'}"
+                f"depth={'ON' if not getattr(self.args, 'no_depth_cam', False) else 'OFF'}"
             )
             print(
                 f"NPCs: vehicles={getattr(self.args, 'npc_vehicles', 0)} walkers={getattr(self.args, 'npc_walkers', 0)} "
@@ -3154,12 +3162,6 @@ class App:
                             last_sensor_to_act_ms = None
                         pending_actuation = None
 
-                if not getattr(self.args, 'no_opencv', False) and not self.headless:
-                    max_vis = 120.0
-                    vis = np.clip(depth_m / max_vis, 0.0, 1.0)
-                    vis8 = (vis * 255.0).astype(np.uint8)
-                    vis8 = cv2.applyColorMap(vis8, cv2.COLORMAP_PLASMA)
-                    cv2.imshow('DEPTH', vis8)
                 # Perception step (YOLO + depth/stereo + gating)
                 detect_ms = None
                 detect_t0 = time.time()
@@ -3207,25 +3209,6 @@ class App:
                             nearest_box = tl_det_box
                             nearest_conf = 0.6 if nearest_conf is None else max(0.6, nearest_conf)
 
-                if not getattr(self.args, 'no_opencv', False) and not self.headless:
-                    hud_dist = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
-                    y_text = 24
-                    mode_label = 'depth camera'
-                    if self.args.range_est == 'pinhole': mode_label = 'pinhole'
-                    elif self.args.range_est == 'stereo': mode_label = 'stereo camera'
-                    cv2.putText(hud_dist, f'Ego→Object distances ({mode_label}, meters):', (10, y_text),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                    y_text += 28
-                    det_points.sort(key=lambda d: d['z'])
-                    if det_points:
-                        for d in det_points[:22]:
-                            xcam, ycam, zcam = d['xyz']
-                            cv2.putText(hud_dist, f"{d['name']:<14}  Z={zcam:5.1f} m   X={xcam:+4.1f} m   Y={ycam:+4.1f} m",
-                                        (10, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 255, 0), 1)
-                            y_text += 22
-                    else:
-                        cv2.putText(hud_dist, 'No detections', (10, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180,180,180), 1)
-                    cv2.imshow('HUD_DIST', hud_dist)
                 if stop_detected_current: stop_persist_count += 1
                 else: stop_persist_count = 0
                 if (not stop_armed) and (stop_persist_count >= self.args.persist_frames):
@@ -3529,12 +3512,17 @@ class App:
 
                 collision_flag = bool(getattr(self.world, 'collision_happened', False))
                 if not self.headless:
+                    mode_label = 'depth camera'
+                    if self.args.range_est == 'pinhole': mode_label = 'pinhole'
+                    elif self.args.range_est == 'stereo': mode_label = 'stereo camera'
+                    elif self.args.range_est == 'both': mode_label = 'depth + pinhole log'
                     self._draw_hud(self.screen, bgr, img_top, perf_fps, perf_ms, x, y, z, yaw, compass,
                                    frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
                                    hold_reason, no_trigger_elapsed, no_red_elapsed, stop_armed,
                                    stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
                                    dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target,
-                                   collision_flag, dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime)
+                                   collision_flag, det_points, mode_label,
+                                   dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime)
 
                 # Periodic concise console log for tuning
                 logN = int(getattr(self.args, 'log_interval_frames', 0) or 0)
@@ -3585,8 +3573,6 @@ class App:
                 ema_loop_ms = 0.9*ema_loop_ms + 0.1*loop_ms
                 loop_ms_max = max(loop_ms_max, loop_ms)
                 v_prev = v
-                if not getattr(self.args, 'no_opencv', False) and not self.headless:
-                    cv2.waitKey(1)
 
                 if not self.headless:
                     for e in pygame.event.get():
@@ -3744,9 +3730,9 @@ def parse_args():
                         help='ROI shrink factor (0..0.9) when sampling stereo disparity depth')
     # Visualization toggles
     parser.add_argument('--no-depth-viz', action='store_true',
-                        help='Hide the DEPTH/HUD_DIST OpenCV windows (alias for --no-opencv)')
+                        help='(Deprecated) Legacy alias for --no-opencv; OpenCV windows are no longer used')
     parser.add_argument('--no-opencv', action='store_true',
-                        help='Disable OpenCV windows entirely (depth/HUD_DIST)')
+                        help='(Deprecated) No effect now that depth/HUD HUD_DIST windows render inside pygame')
     parser.add_argument('--no-top-cam', action='store_true',
                         help='Disable spawning the top view camera and hide it from the HUD')
     parser.add_argument('--no-depth-cam', action='store_true',

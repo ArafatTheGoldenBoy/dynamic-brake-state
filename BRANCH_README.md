@@ -13,6 +13,7 @@ The default CARLA single-camera setup struggles with distant lights and wastes G
 4. **Telephoto fallback** – When the wide camera lacks a qualified TL, the telephoto helper crops/optionally digit-zooms the upper-center region, remaps YOLO boxes back into the original telephoto coordinates, and estimates distance using depth pixels or pinhole geometry. Telephoto inference can be digitally magnified via CLI flags or config constants.
 5. **HSV/Tiny-CNN color classification** – Whichever camera supplies the final TL bbox, an HSV-based classifier inspects the ROI to label it red/yellow/green/unknown. The output feeds a small temporal smoother so sudden flickers do not jerk the braking state machine.
 6. **Braking integration** – The chosen TL state (color + smoothed confidence + source camera + distance) propagates into the braking logic for adaptive stopping behavior.
+7. **HUD logging inside pygame** – The distance readout that previously lived in OpenCV windows now renders directly on the main pygame HUD overlay, keeping the depth camera logic intact while eliminating extra pop-up windows.
 
 ## Configuration checklist
 - `--no-telephoto`: disable the telephoto branch entirely.
