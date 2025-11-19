@@ -38,7 +38,7 @@ except Exception:
 import torch 
 
 # ===================== configuration =====================
-IMG_W, IMG_H      = 960, 540          # each pane (front + top)
+IMG_W, IMG_H      = 960, 540          # display pane size for primary/telephoto views
 FOV_X_DEG         = 90.0              # front cam horizontal FOV
 TELEPHOTO_IMG_W   = 640
 TELEPHOTO_IMG_H   = 360
@@ -1241,7 +1241,7 @@ class RangeEstimator:
 # ===================== World & Sensors ====================
 class SensorRig:
     def __init__(self, world: carla.World, vehicle: carla.Vehicle, range_est: str,
-                 enable_top: bool = True, enable_depth: bool = True, enable_telephoto: bool = True):
+                 enable_depth: bool = True, enable_telephoto: bool = True):
         self.world = world
         self.vehicle = vehicle
         self.range_est = range_est
@@ -1279,14 +1279,6 @@ class SensorRig:
             cam_bp, carla.Transform(carla.Location(x=1.6, z=1.5)), attach_to=vehicle)
         self.q_front: "queue.Queue[carla.Image]" = queue.Queue()
         self.cam_front.listen(self.q_front.put)
-
-        self.cam_top = None
-        self.q_top = None
-        if enable_top:
-            self.cam_top = world.spawn_actor(
-                cam_bp, carla.Transform(carla.Location(x=0.0, z=25.0), carla.Rotation(pitch=-90.0)), attach_to=vehicle)
-            self.q_top = queue.Queue()
-            self.cam_top.listen(self.q_top.put)
 
         self.cam_tele = None
         self.q_tele = None
@@ -1349,7 +1341,7 @@ class SensorRig:
             self.cam_stereo_left.listen(self.q_stereo_left.put)
             self.cam_stereo_right.listen(self.q_stereo_right.put)
 
-        self.actors = [a for a in [self.cam_front, self.cam_top, self.cam_depth,
+        self.actors = [a for a in [self.cam_front, self.cam_depth,
                                    self.cam_stereo_left, self.cam_stereo_right,
                                    self.cam_tele, self.cam_tele_depth] if a is not None]
 
@@ -1395,8 +1387,6 @@ class SensorRig:
         out: Dict[str, Any] = {}
         if expected_frame is None:
             out['front'] = self._get_latest(self.q_front, timeout)
-            if self.q_top is not None:
-                out['top'] = self._get_latest(self.q_top, timeout)
             if self.q_depth is not None:
                 out['depth'] = self._get_latest(self.q_depth, timeout)
             if self.q_stereo_left is not None and self.q_stereo_right is not None:
@@ -1408,8 +1398,6 @@ class SensorRig:
                 out['tele_depth'] = self._get_latest(self.q_tele_depth, timeout)
         else:
             out['front'] = self._get_for_frame(self.q_front, expected_frame, timeout)
-            if self.q_top is not None:
-                out['top'] = self._get_for_frame(self.q_top, expected_frame, timeout)
             if self.q_depth is not None:
                 out['depth'] = self._get_for_frame(self.q_depth, expected_frame, timeout)
             if self.q_stereo_left is not None and self.q_stereo_right is not None:
@@ -2095,7 +2083,7 @@ class App:
         self._hazard_confirm_since = -1.0
         self._aeb_a_des = 0.0
 
-    def _draw_hud(self, screen, bgr, img_top, perf_fps, perf_ms, x, y, z, yaw, compass,
+    def _draw_hud(self, screen, bgr, perf_fps, perf_ms, x, y, z, yaw, compass,
                    frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
                    hold_reason, no_trigger_elapsed, no_red_elapsed, stop_armed,
                    stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
@@ -2106,14 +2094,18 @@ class App:
                    abs_lambda: Optional[float] = None,
                    abs_factor: Optional[float] = None,
                    abs_mu: Optional[float] = None,
-                   abs_regime: Optional[str] = None):
+                   abs_regime: Optional[str] = None,
+                   tele_bgr: Optional[np.ndarray] = None):
         if self.headless:
             return
+        screen.fill((0, 0, 0))
         surf_front = bgr_to_pygame_surface(bgr)
         screen.blit(surf_front, (0, 0))
-        if img_top is not None and not getattr(self.args, 'no_top_cam', False):
-            surf_top = carla_image_to_surface(img_top)
-            screen.blit(surf_top,   (IMG_W, 0))
+        if tele_bgr is not None and self.telephoto_enabled:
+            if tele_bgr.shape[0] != IMG_H or tele_bgr.shape[1] != IMG_W:
+                tele_bgr = cv2.resize(tele_bgr, (IMG_W, IMG_H))
+            surf_tele = bgr_to_pygame_surface(tele_bgr)
+            screen.blit(surf_tele, (IMG_W, 0))
         v_kmh = v * 3.6
         txt0 = f'ego @ x={x:8.2f}  y={y:8.2f}  z={z:6.2f}  | yaw={yaw:+6.1f}° {compass}'
         txt1 = f'Frame {frame_id} | v={v_kmh:5.1f} km/h | trigger={trigger_name or "None"} | TL={tl_state}'
@@ -2241,7 +2233,6 @@ class App:
     # --- IO: read sensors and decode ---
     def _read_frames(self, frames: Dict[str, Any]) -> Dict[str, Any]:
         img_front = frames['front']
-        img_top   = frames.get('top', None)
         img_depth = frames.get('depth', None)
         img_tele  = frames.get('tele_rgb', None)
         img_tele_depth = frames.get('tele_depth', None)
@@ -2278,7 +2269,6 @@ class App:
 
         return {
             'bgr': bgr,
-            'img_top': img_top,
             'depth_m': depth_m,
             'depth_stereo_m': depth_stereo_m,
             'tele_bgr': tele_bgr,
@@ -2954,7 +2944,7 @@ class App:
         pygame.init()
         self.screen = None
         if not self.headless:
-            win_cols = 2 if not getattr(self.args, 'no_top_cam', False) else 1
+            win_cols = 2 if self.telephoto_enabled else 1
             WIN_W, WIN_H = IMG_W * win_cols, IMG_H
             self.screen = pygame.display.set_mode((WIN_W, WIN_H))
             pygame.display.set_caption('Nearestfirst + TL/StopSign | YOLO12n | Sync (OOP)')
@@ -3002,7 +2992,7 @@ class App:
         # One-time startup summary for quick sanity check
         try:
             print(
-                f"Views: top={'ON' if not getattr(self.args, 'no_top_cam', False) else 'OFF'} "
+                f"Views: telephoto={'ON' if self.telephoto_enabled else 'OFF'} "
                 f"depth={'ON' if not getattr(self.args, 'no_depth_cam', False) else 'OFF'}"
             )
             print(
@@ -3039,7 +3029,6 @@ class App:
             self._log_stereo_cmp = True
             self._stereo_csv_w = stereo_csv_w
         self.sensors = SensorRig(self.world.world, self.world.ego, used_range,
-                                 enable_top=(not getattr(self.args, 'no_top_cam', False)),
                                  enable_depth=(not getattr(self.args, 'no_depth_cam', False)),
                                  enable_telephoto=self.telephoto_enabled)
         if self.args.range_est == 'stereo':
@@ -3138,7 +3127,6 @@ class App:
                     sensor_timestamp = getattr(front_frame, 'timestamp', None)
                 io = self._read_frames(frames)
                 bgr = io['bgr']
-                img_top = io['img_top']
                 depth_m = io['depth_m']
                 depth_stereo_m = io['depth_stereo_m']
                 tele_bgr = io.get('tele_bgr')
@@ -3533,13 +3521,14 @@ class App:
                     if self.args.range_est == 'pinhole': mode_label = 'pinhole'
                     elif self.args.range_est == 'stereo': mode_label = 'stereo camera'
                     elif self.args.range_est == 'both': mode_label = 'depth + pinhole log'
-                    self._draw_hud(self.screen, bgr, img_top, perf_fps, perf_ms, x, y, z, yaw, compass,
+                    self._draw_hud(self.screen, bgr, perf_fps, perf_ms, x, y, z, yaw, compass,
                                    frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
                                    hold_reason, no_trigger_elapsed, no_red_elapsed, stop_armed,
                                    stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
                                    dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target,
                                    collision_flag, det_points, mode_label,
-                                   dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime)
+                                   dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime,
+                                   tele_bgr)
 
                 # Periodic concise console log for tuning
                 logN = int(getattr(self.args, 'log_interval_frames', 0) or 0)
