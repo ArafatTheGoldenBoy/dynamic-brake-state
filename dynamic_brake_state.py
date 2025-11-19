@@ -2123,8 +2123,16 @@ class App:
         shadow(screen, txt0, (10, IMG_H-134), (200,200,255))
         shadow(screen, txt1, (10, IMG_H-90), (255,255,255))
         shadow(screen, txt2, (10, IMG_H-68), (0,255,160))
-        if dbg_tau_dyn is not None:
-            shadow(screen, f'tau={dbg_tau_dyn:0.2f}  Dsafe={dbg_D_safety_dyn:0.1f} m  sigma={dbg_sigma_depth:0.2f} m  gate={int(dbg_gate_hit)}  a_des={dbg_a_des:0.2f}  brk={dbg_brake:0.2f}  Vtgt={v_target*3.6:0.0f}km/h',
+        if any(val is not None for val in (dbg_tau_dyn, dbg_D_safety_dyn, dbg_sigma_depth,
+                                           dbg_gate_hit, dbg_a_des, dbg_brake, v_target)):
+            tau_txt = 'n/a' if dbg_tau_dyn is None else f'{dbg_tau_dyn:0.2f}'
+            dsafe_txt = 'n/a' if dbg_D_safety_dyn is None else f'{dbg_D_safety_dyn:0.1f}'
+            sigma_txt = 'n/a' if dbg_sigma_depth is None else f'{dbg_sigma_depth:0.2f}'
+            gate_txt = 'n/a' if dbg_gate_hit is None else f'{int(bool(dbg_gate_hit))}'
+            a_des_txt = 'n/a' if dbg_a_des is None else f'{dbg_a_des:0.2f}'
+            brk_txt = 'n/a' if dbg_brake is None else f'{dbg_brake:0.2f}'
+            vtgt_txt = 'n/a' if v_target is None else f'{v_target*3.6:0.0f}'
+            shadow(screen, f'tau={tau_txt}  Dsafe={dsafe_txt} m  sigma={sigma_txt} m  gate={gate_txt}  a_des={a_des_txt}  brk={brk_txt}  Vtgt={vtgt_txt}km/h',
                    (10, IMG_H-24), (255,255,0))
         if abs_lambda is not None or abs_factor is not None or abs_mu is not None:
             slip_txt = 'n/a' if abs_lambda is None else f'{abs_lambda:.2f}'
