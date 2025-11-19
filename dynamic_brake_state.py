@@ -1,6 +1,6 @@
 from __future__ import print_function
 import os, sys, math, argparse, random, queue, glob, csv
-import time
+import time, traceback
 from typing import Optional, Tuple, List, Dict, Any
 from collections import deque, Counter
 
@@ -2974,6 +2974,7 @@ class App:
 
         self._init_windows()
         clock = pygame.time.Clock()
+        shutdown_reason = 'running'
         if hasattr(self, '_lead_tracker') and self._lead_tracker is not None:
             self._lead_tracker.reset()
 
@@ -3109,12 +3110,20 @@ class App:
         try:
             t0 = time.time()
             while True:
-                frame_id = self.world.tick()
+                try:
+                    frame_id = self.world.tick()
+                except Exception as e:
+                    shutdown_reason = f'world.tick failed: {e}'
+                    raise
                 sim_time += DT
                 self._sim_time = sim_time
                 tic = time.time()
 
-                frames = self.sensors.read(expected_frame=frame_id)
+                try:
+                    frames = self.sensors.read(expected_frame=frame_id)
+                except queue.Empty:
+                    shutdown_reason = 'sensor queue timeout (no new frames)'
+                    break
                 sensor_timestamp = None
                 front_frame = frames.get('front')
                 if front_frame is not None:
@@ -3577,9 +3586,11 @@ class App:
                 if not self.headless:
                     for e in pygame.event.get():
                         if e.type == pygame.QUIT:
+                            shutdown_reason = 'pygame QUIT event'
                             raise KeyboardInterrupt
                         elif e.type == pygame.KEYDOWN:
                             if e.key == pygame.K_ESCAPE:
+                                shutdown_reason = 'ESC pressed'
                                 raise KeyboardInterrupt
                             elif e.key == pygame.K_LEFTBRACKET:
                                 self.detector.conf_thr = max(0.05, round(self.detector.conf_thr - 0.05, 2))
@@ -3628,9 +3639,17 @@ class App:
                         pass
                 clock.tick(int(1.0/DT))
         except KeyboardInterrupt:
-            pass
+            if shutdown_reason == 'running':
+                shutdown_reason = 'KeyboardInterrupt'
+        except Exception as e:
+            shutdown_reason = f'unhandled exception: {e.__class__.__name__}: {e}'
+            traceback.print_exc()
         finally:
             t0 = time.time()
+            try:
+                print(f'[SHUTDOWN] Reason: {shutdown_reason}')
+            except Exception:
+                pass
             try:
                 print('[SHUTDOWN] Closing windows...')
                 self._close_windows()

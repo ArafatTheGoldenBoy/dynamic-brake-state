@@ -14,6 +14,7 @@ The default CARLA single-camera setup struggles with distant lights and wastes G
 5. **HSV/Tiny-CNN color classification** – Whichever camera supplies the final TL bbox, an HSV-based classifier inspects the ROI to label it red/yellow/green/unknown. The output feeds a small temporal smoother so sudden flickers do not jerk the braking state machine.
 6. **Braking integration** – The chosen TL state (color + smoothed confidence + source camera + distance) propagates into the braking logic for adaptive stopping behavior.
 7. **HUD logging inside pygame** – The distance readout that previously lived in OpenCV windows now renders directly on the main pygame HUD overlay, keeping the depth camera logic intact while eliminating extra pop-up windows.
+8. **Explicit shutdown reasons** – The console now prints why the loop exited (e.g., ESC, pygame window close, sensor queue timeout, or CARLA tick failure) before sensors/world cleanup, making surprise stops easier to diagnose.
 
 ## Configuration checklist
 - `--no-telephoto`: disable the telephoto branch entirely.
