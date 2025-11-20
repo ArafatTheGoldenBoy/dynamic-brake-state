@@ -8,6 +8,8 @@ import numpy as np
 import pygame
 import cv2
 
+from dataclasses import dataclass
+
 from calibrations import load_aeb_calibration, load_bus_calibration, load_safety_calibration
 from ecu import (
     ActuationECU,
@@ -56,6 +58,27 @@ from world_manager import WorldManager
 carla = import_carla()
 
 from functools import partial
+
+
+@dataclass
+class ControlContext:
+    """Aggregate persistent control-related state for readability and debugging.
+
+    This collects what used to be scattered across multiple ``self._`` attributes
+    so that braking / hold / timing behavior is easier to reason about and log.
+    """
+
+    I_err: float = 0.0
+    v_prev: float = 0.0
+    stop_armed: bool = False
+    stop_latch_time: float = -1.0
+    stop_release_ignore_until: float = -1.0
+    no_trigger_elapsed: float = 0.0
+    no_red_elapsed: float = 0.0
+    red_green_since: float = -1.0
+    last_s0: float = 0.0
+    tracked_distance: Optional[float] = None
+    tracked_rate: Optional[float] = None
 
 
 def _perception_job_handler(ecu: PerceptionECU, job: PerceptionJob) -> Any:
@@ -646,6 +669,9 @@ class App:
         self._gate_confirm_counter = 0
         self._hazard_confirm_since = -1.0
         self._aeb_a_des = 0.0
+
+        # Aggregate persistent control state in a single context for clarity.
+        self.control_ctx = ControlContext()
 
     def _draw_hud(self, screen, bgr, perf_fps, perf_ms, x, y, z, yaw, compass,
                    frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
