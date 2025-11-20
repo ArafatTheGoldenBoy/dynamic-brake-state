@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Iterable
 
 import numpy as np
 
@@ -192,9 +192,16 @@ class LeadMultiObjectTracker:
                 best_track = tid
         return best_track
 
-    def step(self, sim_time: float, measurement: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        if measurement is not None:
-            tid = self._assign_measurement(measurement)
+    def step(self, sim_time: float, measurement: Optional[Any]) -> Optional[Dict[str, Any]]:
+        if measurement is None:
+            measurements: Iterable[Dict[str, Any]] = []
+        elif isinstance(measurement, dict):
+            measurements = [measurement]
+        else:
+            measurements = [m for m in measurement if isinstance(m, dict)]
+
+        for meas in measurements:
+            tid = self._assign_measurement(meas)
             if tid is None and len(self._tracks) < self.max_tracks:
                 tid = self._next_id
                 self._next_id += 1
@@ -203,12 +210,12 @@ class LeadMultiObjectTracker:
                 tracker = self._tracks.get(tid)
                 if tracker is not None:
                     meta = self._track_meta.setdefault(tid, {})
-                    meta['box'] = measurement.get('box')
-                    meta['kind'] = measurement.get('kind')
+                    meta['box'] = meas.get('box')
+                    meta['kind'] = meas.get('kind')
                     meta['last_update'] = sim_time
-                    tracker.box = measurement.get('box')
-                    tracker.kind = measurement.get('kind')
-                    tracker.step(sim_time, measurement)
+                    tracker.box = meas.get('box')
+                    tracker.kind = meas.get('kind')
+                    tracker.step(sim_time, meas)
         to_drop = []
         for tid, tracker in self._tracks.items():
             meta = self._track_meta.get(tid, {})
