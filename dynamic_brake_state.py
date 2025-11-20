@@ -1852,18 +1852,17 @@ class App:
                     red_green_since = -1.0
 
                 tracker_state = None
-                tracker_active_states: List[Dict[str, Any]] = []
                 tracked_distance_for_control = None
                 tracked_rate = None
                 tracker = getattr(self, '_lead_tracker', None)
                 if tracker is not None:
                     obstacle_measurements = perc.get('obstacle_measurements', [])
-                    tracker_state, tracker_active_states = tracker.step(sim_time, obstacle_measurements)
+                    tracker_state = tracker.step(sim_time, obstacle_measurements)
                     if tracker_state is not None:
                         tracked_distance_for_control = tracker_state.get('distance')
                         tracked_rate = tracker_state.get('rate')
-                lead_track_id = tracker_state.get('track_id') if tracker_state is not None else None
-                lead_track_count = len(tracker_active_states)
+                lead_track_id = tracker_state.get('id') if tracker_state is not None else None
+                lead_track_count = tracker_state.get('tracker_count', 0) if tracker_state is not None else 0
                 if tracked_distance_for_control is None:
                     if nearest_s_active is not None:
                         tracked_distance_for_control = nearest_s_active
