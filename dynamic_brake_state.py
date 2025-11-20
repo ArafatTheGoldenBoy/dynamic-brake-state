@@ -1,7 +1,8 @@
 from __future__ import print_function
-import os, sys, math, argparse, random, queue, glob
-import time
+import os, sys, math, argparse, random, queue, glob, csv
+import time, traceback
 from typing import Optional, Tuple, List, Dict, Any
+from collections import deque, Counter
 
 import numpy as np
 import pygame
@@ -37,8 +38,19 @@ except Exception:
 import torch 
 
 # ===================== configuration =====================
-IMG_W, IMG_H      = 960, 540          # each pane (front + top)
+IMG_W, IMG_H      = 960, 540          # display pane size for primary/telephoto views
 FOV_X_DEG         = 90.0              # front cam horizontal FOV
+TELEPHOTO_IMG_W   = 640
+TELEPHOTO_IMG_H   = 360
+TELEPHOTO_FOV_X_DEG = 25.0
+TELEPHOTO_STRIDE_DEFAULT = 3
+TELEPHOTO_CACHE_MAX_AGE_S = 0.6
+TELEPHOTO_DIGITAL_ZOOM_DEFAULT = 1.5
+TELEPHOTO_DIGITAL_ZOOM_MAX = 3.5
+TELEPHOTO_ZOOM_TOP_BIAS = 0.35
+TL_PRIMARY_CROP_FRAC = 0.20
+TL_PRIMARY_SHORT_RANGE_M = 50.0
+TL_STATE_SMOOTHING_FRAMES = 5
 DT                = 0.02              # 50 Hz (set 0.02 for lower latency)
 FX                = (IMG_W / 2.0) / math.tan(math.radians(FOV_X_DEG / 2.0))
 
@@ -854,10 +866,12 @@ def estimate_tl_color_from_roi(bgr: np.ndarray, box: Tuple[int,int,int,int]) -> 
     x,y,w,h = box
     if w <= 0 or h <= 0:
         return 'UNKNOWN'
-    roi = bgr[max(0,y):min(IMG_H,y+h), max(0,x):min(IMG_W,x+w)]
+    h_lim, w_lim = bgr.shape[0], bgr.shape[1]
+    roi = bgr[max(0,y):min(h_lim,y+h), max(0,x):min(w_lim,x+w)]
     if roi.size == 0:
         return 'UNKNOWN'
-    thirds = [(0, int(h/3)), (int(h/3), int(2*h/3)), (int(2*h/3), h)]
+    roi_h = roi.shape[0]
+    thirds = [(0, int(roi_h/3)), (int(roi_h/3), int(2*roi_h/3)), (int(2*roi_h/3), roi_h)]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     means = []
     for (y0,y1) in thirds:
@@ -897,6 +911,52 @@ def estimate_tl_color_from_roi(bgr: np.ndarray, box: Tuple[int,int,int,int]) -> 
             if g_frac > 0.35:
                 return 'GREEN'
     return 'UNKNOWN'
+
+
+def apply_digital_zoom(image: np.ndarray, zoom: float,
+                       top_bias: float = TELEPHOTO_ZOOM_TOP_BIAS) -> Tuple[np.ndarray, Optional[Dict[str, Any]]]:
+    """Crop/resize the upper-center region of an image to emulate extra zoom."""
+    if image is None:
+        return image, None
+    zoom = max(1.0, float(zoom))
+    if zoom <= 1.0 + 1e-3:
+        return image, None
+    h, w = image.shape[:2]
+    crop_w = max(4, min(w, int(round(w / zoom))))
+    crop_h = max(4, min(h, int(round(h / zoom))))
+    x0 = max(0, (w - crop_w) // 2)
+    bias = max(0.0, min(1.0, float(top_bias)))
+    y0 = max(0, min(h - crop_h, int(round((h - crop_h) * bias))))
+    crop = image[y0:y0 + crop_h, x0:x0 + crop_w]
+    resized = cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR)
+    meta = {
+        'crop': (x0, y0, crop_w, crop_h),
+        'scale_x': crop_w / float(w),
+        'scale_y': crop_h / float(h),
+    }
+    return resized, meta
+
+
+def remap_zoom_box(box: Tuple[int, int, int, int], meta: Optional[Dict[str, Any]],
+                   full_w: int, full_h: int) -> Tuple[int, int, int, int]:
+    """Convert a bounding box from zoomed coordinates back to original space."""
+    if not meta:
+        return box
+    x0, y0, crop_w, crop_h = meta['crop']
+    scale_x = meta['scale_x']
+    scale_y = meta['scale_y']
+    x1, y1, w, h = box
+    x1_full = int(round(x0 + x1 * scale_x))
+    y1_full = int(round(y0 + y1 * scale_y))
+    w_full = int(round(max(1, w * scale_x)))
+    h_full = int(round(max(1, h * scale_y)))
+    x1_full = max(0, min(full_w - 1, x1_full))
+    y1_full = max(0, min(full_h - 1, y1_full))
+    if x1_full + w_full > full_w:
+        w_full = max(1, full_w - x1_full)
+    if y1_full + h_full > full_h:
+        h_full = max(1, full_h - y1_full)
+    return x1_full, y1_full, w_full, h_full
 
 # ===================== data types =====================
 from dataclasses import dataclass
@@ -1181,10 +1241,11 @@ class RangeEstimator:
 # ===================== World & Sensors ====================
 class SensorRig:
     def __init__(self, world: carla.World, vehicle: carla.Vehicle, range_est: str,
-                 enable_top: bool = True, enable_depth: bool = True):
+                 enable_depth: bool = True, enable_telephoto: bool = True):
         self.world = world
         self.vehicle = vehicle
         self.range_est = range_est
+        self.enable_telephoto = enable_telephoto
         bp_lib = world.get_blueprint_library()
 
         cam_bp = bp_lib.find('sensor.camera.rgb')
@@ -1219,13 +1280,41 @@ class SensorRig:
         self.q_front: "queue.Queue[carla.Image]" = queue.Queue()
         self.cam_front.listen(self.q_front.put)
 
-        self.cam_top = None
-        self.q_top = None
-        if enable_top:
-            self.cam_top = world.spawn_actor(
-                cam_bp, carla.Transform(carla.Location(x=0.0, z=25.0), carla.Rotation(pitch=-90.0)), attach_to=vehicle)
-            self.q_top = queue.Queue()
-            self.cam_top.listen(self.q_top.put)
+        self.cam_tele = None
+        self.q_tele = None
+        self.cam_tele_depth = None
+        self.q_tele_depth = None
+        if enable_telephoto:
+            tele_bp = bp_lib.find('sensor.camera.rgb')
+            tele_bp.set_attribute('image_size_x', str(TELEPHOTO_IMG_W))
+            tele_bp.set_attribute('image_size_y', str(TELEPHOTO_IMG_H))
+            tele_bp.set_attribute('fov', str(TELEPHOTO_FOV_X_DEG))
+            tele_bp.set_attribute('fstop', '8.0')
+            tele_bp.set_attribute('focal_distance', '1000.0')
+            tele_bp.set_attribute('lens_circle_multiplier', '0.0')
+            tele_bp.set_attribute('lens_k', '0.0')
+            try:
+                if tele_bp.has_attribute('motion_blur_intensity'):
+                    tele_bp.set_attribute('motion_blur_intensity', '0.0')
+                if tele_bp.has_attribute('motion_blur_max_distortion'):
+                    tele_bp.set_attribute('motion_blur_max_distortion', '0.0')
+                if tele_bp.has_attribute('motion_blur_min_object_screen_size'):
+                    tele_bp.set_attribute('motion_blur_min_object_screen_size', '1.0')
+            except RuntimeError:
+                pass
+            tele_tf = carla.Transform(carla.Location(x=1.6, z=1.5))
+            self.cam_tele = world.spawn_actor(tele_bp, tele_tf, attach_to=vehicle)
+            self.q_tele = queue.Queue()
+            self.cam_tele.listen(self.q_tele.put)
+
+            if enable_depth:
+                tele_depth_bp = bp_lib.find('sensor.camera.depth')
+                tele_depth_bp.set_attribute('image_size_x', str(TELEPHOTO_IMG_W))
+                tele_depth_bp.set_attribute('image_size_y', str(TELEPHOTO_IMG_H))
+                tele_depth_bp.set_attribute('fov', str(TELEPHOTO_FOV_X_DEG))
+                self.cam_tele_depth = world.spawn_actor(tele_depth_bp, tele_tf, attach_to=vehicle)
+                self.q_tele_depth = queue.Queue()
+                self.cam_tele_depth.listen(self.q_tele_depth.put)
 
         depth_bp = bp_lib.find('sensor.camera.depth')
         depth_bp.set_attribute('image_size_x', str(IMG_W))
@@ -1252,7 +1341,9 @@ class SensorRig:
             self.cam_stereo_left.listen(self.q_stereo_left.put)
             self.cam_stereo_right.listen(self.q_stereo_right.put)
 
-        self.actors = [a for a in [self.cam_front, self.cam_top, self.cam_depth, self.cam_stereo_left, self.cam_stereo_right] if a is not None]
+        self.actors = [a for a in [self.cam_front, self.cam_depth,
+                                   self.cam_stereo_left, self.cam_stereo_right,
+                                   self.cam_tele, self.cam_tele_depth] if a is not None]
 
     @staticmethod
     def _get_latest(q: "queue.Queue[Any]", timeout: float):
@@ -1296,22 +1387,26 @@ class SensorRig:
         out: Dict[str, Any] = {}
         if expected_frame is None:
             out['front'] = self._get_latest(self.q_front, timeout)
-            if self.q_top is not None:
-                out['top'] = self._get_latest(self.q_top, timeout)
             if self.q_depth is not None:
                 out['depth'] = self._get_latest(self.q_depth, timeout)
             if self.q_stereo_left is not None and self.q_stereo_right is not None:
                 out['stereo_left']  = self._get_latest(self.q_stereo_left, timeout)
                 out['stereo_right'] = self._get_latest(self.q_stereo_right, timeout)
+            if self.q_tele is not None:
+                out['tele_rgb'] = self._get_latest(self.q_tele, timeout)
+            if self.q_tele_depth is not None:
+                out['tele_depth'] = self._get_latest(self.q_tele_depth, timeout)
         else:
             out['front'] = self._get_for_frame(self.q_front, expected_frame, timeout)
-            if self.q_top is not None:
-                out['top'] = self._get_for_frame(self.q_top, expected_frame, timeout)
             if self.q_depth is not None:
                 out['depth'] = self._get_for_frame(self.q_depth, expected_frame, timeout)
             if self.q_stereo_left is not None and self.q_stereo_right is not None:
                 out['stereo_left']  = self._get_for_frame(self.q_stereo_left, expected_frame, timeout)
                 out['stereo_right'] = self._get_for_frame(self.q_stereo_right, expected_frame, timeout)
+            if self.q_tele is not None:
+                out['tele_rgb'] = self._get_for_frame(self.q_tele, expected_frame, timeout)
+            if self.q_tele_depth is not None:
+                out['tele_depth'] = self._get_for_frame(self.q_tele_depth, expected_frame, timeout)
         return out
 
     def destroy(self):
@@ -1839,6 +1934,53 @@ class App:
                                       dnn=self.args.yolo_dnn,
                                       augment=self.args.yolo_augment,
                                       per_class_iou_map=parse_per_class_iou_map(self.args.yolo_class_iou))
+        self.telephoto_enabled = not getattr(self.args, 'no_telephoto', False)
+        try:
+            stride_raw = int(getattr(self.args, 'telephoto_stride', TELEPHOTO_STRIDE_DEFAULT))
+        except Exception:
+            stride_raw = TELEPHOTO_STRIDE_DEFAULT
+        self.telephoto_stride = max(2, stride_raw)
+        try:
+            zoom_raw = float(getattr(self.args, 'telephoto_zoom', TELEPHOTO_DIGITAL_ZOOM_DEFAULT))
+        except Exception:
+            zoom_raw = TELEPHOTO_DIGITAL_ZOOM_DEFAULT
+        self.telephoto_zoom = max(1.0, min(TELEPHOTO_DIGITAL_ZOOM_MAX, zoom_raw))
+        self.telephoto_intrinsics = intrinsics_from_fov(TELEPHOTO_IMG_W, TELEPHOTO_IMG_H, TELEPHOTO_FOV_X_DEG)
+        self._tl_state_history: deque = deque(maxlen=TL_STATE_SMOOTHING_FRAMES)
+        self._telephoto_compute_totals: Dict[str, Any] = {
+            'primary_calls': 0,
+            'primary_time_s': 0.0,
+            'telephoto_calls': 0,
+            'telephoto_time_s': 0.0,
+            'telephoto_invocations': 0,
+            'telephoto_frames_considered': 0,
+            'telephoto_skipped_disabled': 0,
+            'telephoto_skipped_stride': 0,
+            'telephoto_cache_hits': 0,
+        }
+        self.telephoto_compute_log_path = getattr(self.args, 'telephoto_compute_log', None)
+        self.telephoto_compute_fp = None
+        self.telephoto_compute_writer = None
+        if self.telephoto_compute_log_path:
+            try:
+                self.telephoto_compute_fp = open(self.telephoto_compute_log_path, 'w', newline='')
+                self.telephoto_compute_writer = csv.writer(self.telephoto_compute_fp)
+                self.telephoto_compute_writer.writerow([
+                    'timestamp', 'telephoto_enabled', 'telephoto_stride', 'telephoto_zoom',
+                    'primary_calls', 'primary_total_ms',
+                    'telephoto_invocations', 'telephoto_frames_considered',
+                    'telephoto_calls', 'telephoto_total_ms',
+                    'telephoto_cache_hits', 'telephoto_skipped_stride', 'telephoto_skipped_disabled',
+                    'with_telephoto_total_ms', 'without_telephoto_total_ms'
+                ])
+            except Exception as e:
+                print(f"[WARN] Failed to open telephoto compute log: {e}")
+                self.telephoto_compute_log_path = None
+                self.telephoto_compute_fp = None
+                self.telephoto_compute_writer = None
+        self._telephoto_last_candidate: Optional[Dict[str, Any]] = None
+        self._telephoto_last_time: float = -1.0
+        self._frame_index = 0
         self.class_conf_map = parse_per_class_conf_map(self.args.yolo_class_thr)
         self.engage_override_map = parse_engage_override_map(self.args.engage_override)
         self.min_h_map = parse_min_h_override_map(self.args.min_h_override)
@@ -1941,23 +2083,29 @@ class App:
         self._hazard_confirm_since = -1.0
         self._aeb_a_des = 0.0
 
-    def _draw_hud(self, screen, bgr, img_top, perf_fps, perf_ms, x, y, z, yaw, compass,
+    def _draw_hud(self, screen, bgr, perf_fps, perf_ms, x, y, z, yaw, compass,
                    frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
                    hold_reason, no_trigger_elapsed, no_red_elapsed, stop_armed,
                    stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
                    dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target,
                    collision_flag: bool,
+                   det_points: Optional[List[Dict[str, Any]]] = None,
+                   range_mode_label: Optional[str] = None,
                    abs_lambda: Optional[float] = None,
                    abs_factor: Optional[float] = None,
                    abs_mu: Optional[float] = None,
-                   abs_regime: Optional[str] = None):
+                   abs_regime: Optional[str] = None,
+                   tele_bgr: Optional[np.ndarray] = None):
         if self.headless:
             return
+        screen.fill((0, 0, 0))
         surf_front = bgr_to_pygame_surface(bgr)
         screen.blit(surf_front, (0, 0))
-        if img_top is not None and not getattr(self.args, 'no_top_cam', False):
-            surf_top = carla_image_to_surface(img_top)
-            screen.blit(surf_top,   (IMG_W, 0))
+        if tele_bgr is not None and self.telephoto_enabled:
+            if tele_bgr.shape[0] != IMG_H or tele_bgr.shape[1] != IMG_W:
+                tele_bgr = cv2.resize(tele_bgr, (IMG_W, IMG_H))
+            surf_tele = bgr_to_pygame_surface(tele_bgr)
+            screen.blit(surf_tele, (IMG_W, 0))
         v_kmh = v * 3.6
         txt0 = f'ego @ x={x:8.2f}  y={y:8.2f}  z={z:6.2f}  | yaw={yaw:+6.1f}° {compass}'
         txt1 = f'Frame {frame_id} | v={v_kmh:5.1f} km/h | trigger={trigger_name or "None"} | TL={tl_state}'
@@ -1967,8 +2115,16 @@ class App:
         shadow(screen, txt0, (10, IMG_H-134), (200,200,255))
         shadow(screen, txt1, (10, IMG_H-90), (255,255,255))
         shadow(screen, txt2, (10, IMG_H-68), (0,255,160))
-        if dbg_tau_dyn is not None:
-            shadow(screen, f'tau={dbg_tau_dyn:0.2f}  Dsafe={dbg_D_safety_dyn:0.1f} m  sigma={dbg_sigma_depth:0.2f} m  gate={int(dbg_gate_hit)}  a_des={dbg_a_des:0.2f}  brk={dbg_brake:0.2f}  Vtgt={v_target*3.6:0.0f}km/h',
+        if any(val is not None for val in (dbg_tau_dyn, dbg_D_safety_dyn, dbg_sigma_depth,
+                                           dbg_gate_hit, dbg_a_des, dbg_brake, v_target)):
+            tau_txt = 'n/a' if dbg_tau_dyn is None else f'{dbg_tau_dyn:0.2f}'
+            dsafe_txt = 'n/a' if dbg_D_safety_dyn is None else f'{dbg_D_safety_dyn:0.1f}'
+            sigma_txt = 'n/a' if dbg_sigma_depth is None else f'{dbg_sigma_depth:0.2f}'
+            gate_txt = 'n/a' if dbg_gate_hit is None else f'{int(bool(dbg_gate_hit))}'
+            a_des_txt = 'n/a' if dbg_a_des is None else f'{dbg_a_des:0.2f}'
+            brk_txt = 'n/a' if dbg_brake is None else f'{dbg_brake:0.2f}'
+            vtgt_txt = 'n/a' if v_target is None else f'{v_target*3.6:0.0f}'
+            shadow(screen, f'tau={tau_txt}  Dsafe={dsafe_txt} m  sigma={sigma_txt} m  gate={gate_txt}  a_des={a_des_txt}  brk={brk_txt}  Vtgt={vtgt_txt}km/h',
                    (10, IMG_H-24), (255,255,0))
         if abs_lambda is not None or abs_factor is not None or abs_mu is not None:
             slip_txt = 'n/a' if abs_lambda is None else f'{abs_lambda:.2f}'
@@ -1978,6 +2134,23 @@ class App:
             shadow(screen,
                    f'ABS slip={slip_txt}  f={fac_txt}  mu_est={mu_txt}  regime={regime_txt}',
                    (10, IMG_H-46), (180,255,255))
+        log_y = 10
+        log_x = 10
+        mode_label = range_mode_label or 'range'
+        shadow(screen, f'Ego→Object distances ({mode_label}, meters):', (log_x, log_y), (0, 255, 255))
+        log_y += 22
+        det_points_sorted: List[Dict[str, Any]] = []
+        if det_points:
+            det_points_sorted = sorted(det_points, key=lambda d: d.get('z', float('inf')))
+        if det_points_sorted:
+            for d in det_points_sorted[:22]:
+                xcam, ycam, zcam = d['xyz']
+                shadow(screen,
+                       f"{d['name']:<14}  Z={zcam:5.1f} m   X={xcam:+4.1f} m   Y={ycam:+4.1f} m",
+                       (log_x, log_y), (180, 255, 180))
+                log_y += 18
+        else:
+            shadow(screen, 'No detections', (log_x, log_y), (180, 180, 180))
         if collision_flag:
             shadow(screen, '*** COLLISION DETECTED ***', (IMG_W//4, IMG_H//2), (255,40,40))
         pygame.display.flip()
@@ -2060,8 +2233,9 @@ class App:
     # --- IO: read sensors and decode ---
     def _read_frames(self, frames: Dict[str, Any]) -> Dict[str, Any]:
         img_front = frames['front']
-        img_top   = frames.get('top', None)
         img_depth = frames.get('depth', None)
+        img_tele  = frames.get('tele_rgb', None)
+        img_tele_depth = frames.get('tele_depth', None)
 
         arr_front = np.frombuffer(img_front.raw_data, dtype=np.uint8).reshape((IMG_H, IMG_W, 4))
         bgr = arr_front[:, :, :3].copy()
@@ -2084,20 +2258,34 @@ class App:
             except Exception:
                 depth_stereo_m = None
 
+        tele_bgr = None
+        if img_tele is not None:
+            arr_tele = np.frombuffer(img_tele.raw_data, dtype=np.uint8).reshape((TELEPHOTO_IMG_H, TELEPHOTO_IMG_W, 4))
+            tele_bgr = arr_tele[:, :, :3].copy()
+        tele_depth_m = None
+        if img_tele_depth is not None:
+            tele_depth_bgra = np.frombuffer(img_tele_depth.raw_data, dtype=np.uint8).reshape((TELEPHOTO_IMG_H, TELEPHOTO_IMG_W, 4))
+            tele_depth_m = decode_depth_meters_from_bgra(tele_depth_bgra)
+
         return {
             'bgr': bgr,
-            'img_top': img_top,
             'depth_m': depth_m,
             'depth_stereo_m': depth_stereo_m,
+            'tele_bgr': tele_bgr,
+            'tele_depth_m': tele_depth_m,
         }
 
     # --- Perception: detection, distances, gating, TL/stop extraction ---
     def _perception_step(self, bgr: np.ndarray, depth_m: np.ndarray, depth_stereo_m: Optional[np.ndarray],
                          FX_: float, FY_: float, CX_: float, CY_: float,
                          sim_time: float, sensor_timestamp: Optional[float], v: float, MU: float,
-                         log_both: bool, csv_w) -> Dict[str, Any]:
+                         log_both: bool, csv_w,
+                         tele_bgr: Optional[np.ndarray] = None,
+                         tele_depth_m: Optional[np.ndarray] = None) -> Dict[str, Any]:
         labels = self.detector.labels or {}
+        detect_t0 = time.perf_counter()
         classIds, confs, boxes = self.detector.predict_raw(bgr)
+        self._record_compute_time('primary', time.perf_counter() - detect_t0)
 
         nearest_s_active = None
         nearest_kind = None
@@ -2107,6 +2295,9 @@ class App:
         stop_detected_current = False
 
         tl_det_s, tl_det_box, tl_det_state = None, None, 'UNKNOWN'
+        tl_candidate_primary_near: Optional[Dict[str, Any]] = None
+        tl_candidate_primary_any: Optional[Dict[str, Any]] = None
+        tl_source = 'none'
         obstacle_measurements: List[Dict[str, Any]] = []
 
         det_points: List[Dict[str, Any]] = []
@@ -2117,6 +2308,7 @@ class App:
         want_depth_samples = (self.args.range_est in ('depth', 'both', 'stereo')) or log_both or getattr(self, '_log_stereo_cmp', False)
         want_stereo_samples = ((self.args.range_est in ('stereo', 'both')) or getattr(self, '_log_stereo_cmp', False) or log_both) and (depth_stereo_m is not None)
 
+        primary_crop_top = int(TL_PRIMARY_CROP_FRAC * IMG_H)
         if len(classIds) != 0:
             cx0 = IMG_W/2.0
             for cid, conf, box in zip(np.array(classIds).flatten(), np.array(confs).flatten(), boxes):
@@ -2180,10 +2372,21 @@ class App:
                 if not lateral_ok:
                     continue
 
+                tl_state_roi = 'UNKNOWN'
                 if is_tl_like:
-                    tl_state_roi = estimate_tl_color_from_roi(bgr, (x1, y1, w, h))
-                    if (tl_det_s is None) or (s_use < tl_det_s):
-                        tl_det_s, tl_det_box, tl_det_state = s_use, (x1, y1, w, h), tl_state_roi
+                    if y2 <= primary_crop_top:
+                        continue
+                    y_tl = max(y1, primary_crop_top)
+                    h_tl = max(1, y2 - y_tl)
+                    tl_state_roi = estimate_tl_color_from_roi(bgr, (x1, y_tl, w, h_tl))
+                    if s_use is not None:
+                        cand = {'distance': float(s_use), 'box': (x1, y1, w, h),
+                                'state': tl_state_roi, 'source': 'primary'}
+                        if (tl_candidate_primary_any is None) or (cand['distance'] < tl_candidate_primary_any['distance']):
+                            tl_candidate_primary_any = cand
+                        if cand['distance'] <= TL_PRIMARY_SHORT_RANGE_M:
+                            if (tl_candidate_primary_near is None) or (cand['distance'] < tl_candidate_primary_near['distance']):
+                                tl_candidate_primary_near = cand
 
                 if (nearest_s_active is None) or (s_use < nearest_s_active):
                     nearest_s_active = s_use
@@ -2209,7 +2412,7 @@ class App:
                 color = (0,255,255)
                 if norm == 'stopsign': color = (0,0,255)
                 if is_tl_like:
-                    label = f'{name} {tl_det_state}'
+                    label = f'{name} {tl_state_roi}'
                 else:
                     label = f'{name}'
                 cv2.rectangle(bgr, (x1, y1), (x2, y2), color, 2)
@@ -2278,6 +2481,24 @@ class App:
                         stereo_val, depth_val, err_val, pin_val, v, MU
                     ])
 
+        tl_candidate = tl_candidate_primary_near
+        if tl_candidate is None:
+            tele_cand = self._maybe_run_telephoto_tl(tele_bgr, tele_depth_m, depth_roi, sim_time)
+            if tele_cand is not None:
+                tl_candidate = tele_cand
+        if tl_candidate is None and tl_candidate_primary_any is not None:
+            tl_candidate = tl_candidate_primary_any
+        if tl_candidate is not None:
+            tl_det_s = tl_candidate.get('distance')
+            tl_det_box = tl_candidate.get('box') if tl_candidate.get('source') == 'primary' else None
+            tl_det_state = tl_candidate.get('state', 'UNKNOWN')
+            tl_source = tl_candidate.get('source', 'primary')
+        else:
+            tl_det_s, tl_det_box, tl_det_state = None, None, 'UNKNOWN'
+            tl_source = 'none'
+
+        tl_det_state, tl_det_s = self._smooth_tl_state(tl_det_state, tl_det_s)
+
         # Merge with CARLA TL actor state
         tl_state_actor = 'UNKNOWN'
         try:
@@ -2302,9 +2523,150 @@ class App:
             'tl_state': tl_state,
             'tl_s_active': tl_det_s,
             'tl_det_box': tl_det_box,
+            'tl_source': tl_source,
             'stop_detected_current': stop_detected_current,
             'obstacle_measurements': obstacle_measurements,
         }
+
+    def _smooth_tl_state(self, state: str, distance: Optional[float]) -> Tuple[str, Optional[float]]:
+        if not hasattr(self, '_tl_state_history') or self._tl_state_history.maxlen != TL_STATE_SMOOTHING_FRAMES:
+            self._tl_state_history = deque(maxlen=TL_STATE_SMOOTHING_FRAMES)
+        self._tl_state_history.append({'state': state, 'distance': distance})
+        votes = [entry for entry in self._tl_state_history if entry['state'] != 'UNKNOWN']
+        if votes:
+            counts = Counter(entry['state'] for entry in votes)
+            best_state, _ = counts.most_common(1)[0]
+            dists = [entry['distance'] for entry in votes if entry['state'] == best_state and entry['distance'] is not None]
+            best_dist = None
+            if dists:
+                best_dist = float(sum(dists) / len(dists))
+            elif distance is not None:
+                best_dist = distance
+            return best_state, best_dist
+        return state, distance
+
+    def _record_compute_time(self, scope: str, duration_s: float):
+        stats = getattr(self, '_telephoto_compute_totals', None)
+        if stats is None or duration_s is None:
+            return
+        if scope == 'primary':
+            stats['primary_calls'] += 1
+            stats['primary_time_s'] += max(0.0, float(duration_s))
+        elif scope == 'telephoto':
+            stats['telephoto_calls'] += 1
+            stats['telephoto_time_s'] += max(0.0, float(duration_s))
+
+    def _maybe_write_telephoto_compute_summary(self):
+        stats = getattr(self, '_telephoto_compute_totals', None)
+        if not stats:
+            return
+        primary_ms = stats.get('primary_time_s', 0.0) * 1000.0
+        telephoto_ms = stats.get('telephoto_time_s', 0.0) * 1000.0
+        with_ms = primary_ms + telephoto_ms
+        without_ms = primary_ms
+        if stats.get('primary_calls', 0) == 0 and stats.get('telephoto_invocations', 0) == 0:
+            return
+        try:
+            print(
+                f"[TELEPHOTO] compute totals | primary={primary_ms:.1f}ms (calls={stats.get('primary_calls', 0)}) "
+                f"telephoto={telephoto_ms:.1f}ms (runs={stats.get('telephoto_calls', 0)} stride_skips={stats.get('telephoto_skipped_stride', 0)}) "
+                f"with={with_ms:.1f}ms vs without={without_ms:.1f}ms"
+            )
+        except Exception:
+            pass
+        writer = getattr(self, 'telephoto_compute_writer', None)
+        fp = getattr(self, 'telephoto_compute_fp', None)
+        if writer is None or fp is None:
+            return
+        timestamp = time.time()
+        try:
+            writer.writerow([
+                f"{timestamp:.3f}",
+                bool(self.telephoto_enabled),
+                int(self.telephoto_stride),
+                float(self.telephoto_zoom),
+                stats.get('primary_calls', 0),
+                f"{primary_ms:.3f}",
+                stats.get('telephoto_invocations', 0),
+                stats.get('telephoto_frames_considered', 0),
+                stats.get('telephoto_calls', 0),
+                f"{telephoto_ms:.3f}",
+                stats.get('telephoto_cache_hits', 0),
+                stats.get('telephoto_skipped_stride', 0),
+                stats.get('telephoto_skipped_disabled', 0),
+                f"{with_ms:.3f}",
+                f"{without_ms:.3f}",
+            ])
+            fp.flush()
+        except Exception:
+            pass
+
+    def _maybe_run_telephoto_tl(self, tele_bgr: Optional[np.ndarray], tele_depth_m: Optional[np.ndarray],
+                                depth_roi: float, sim_time: float) -> Optional[Dict[str, Any]]:
+        stats = getattr(self, '_telephoto_compute_totals', None)
+        if stats is not None:
+            stats['telephoto_invocations'] += 1
+        if not self.telephoto_enabled or tele_bgr is None:
+            if stats is not None:
+                stats['telephoto_skipped_disabled'] += 1
+            return None
+        stride = max(2, int(self.telephoto_stride))
+        if stats is not None:
+            stats['telephoto_frames_considered'] += 1
+        frame_idx = getattr(self, '_frame_index', 0)
+        run_now = (frame_idx % stride) == 0
+        cached = getattr(self, '_telephoto_last_candidate', None)
+        if not run_now:
+            if stats is not None:
+                stats['telephoto_skipped_stride'] += 1
+            if cached is not None and (sim_time - float(self._telephoto_last_time)) <= TELEPHOTO_CACHE_MAX_AGE_S:
+                if stats is not None:
+                    stats['telephoto_cache_hits'] += 1
+                return cached
+            return None
+
+        infer_img = tele_bgr
+        zoom_meta = None
+        if self.telephoto_zoom > 1.0 + 1e-3:
+            infer_img, zoom_meta = apply_digital_zoom(tele_bgr, self.telephoto_zoom)
+        t0 = time.perf_counter()
+        classIds, confs, boxes = self.detector.predict_raw(infer_img)
+        self._record_compute_time('telephoto', time.perf_counter() - t0)
+        labels = self.detector.labels or {}
+        best: Optional[Dict[str, Any]] = None
+        _, fy_t, _, _ = self.telephoto_intrinsics
+        for cid, conf, box in zip(np.array(classIds).flatten(), np.array(confs).flatten(), boxes):
+            x1, y1, w, h = map(int, box)
+            name = labels.get(cid, str(cid))
+            norm = _norm_label(name)
+            if 'traffic' not in norm or 'light' not in norm:
+                continue
+            conf_req = self.class_conf_map.get(norm, self.detector.conf_thr)
+            if conf < conf_req:
+                continue
+            if h <= 0 or w <= 0:
+                continue
+            full_box = remap_zoom_box((x1, y1, w, h), zoom_meta, tele_bgr.shape[1], tele_bgr.shape[0])
+            x1_f, y1_f, w_f, h_f = full_box
+            if h_f <= 0 or w_f <= 0:
+                continue
+            H_real = OBJ_HEIGHT_M.get(name, OBJ_HEIGHT_M.get('traffic light'))
+            s_pinhole = (fy_t * float(H_real)) / float(h_f) if (H_real is not None and h_f > 0) else None
+            s_depth = None
+            if tele_depth_m is not None:
+                s_depth = median_depth_in_box(tele_depth_m, full_box, shrink=depth_roi)
+            s_use = s_depth if s_depth is not None else s_pinhole
+            if s_use is None or not math.isfinite(s_use):
+                continue
+            tl_state_roi = estimate_tl_color_from_roi(tele_bgr, full_box)
+            cand = {'distance': float(s_use), 'box': full_box,
+                    'state': tl_state_roi, 'source': 'telephoto'}
+            if best is None or cand['distance'] < best['distance']:
+                best = cand
+
+        self._telephoto_last_candidate = best
+        self._telephoto_last_time = sim_time
+        return best
 
     # --- Safety envelope: compute tau_dyn, D_safety_dyn, sigma_depth with smoothing ---
     def _safety_envelope(self, v: float, MU: float, ema_loop_ms: float,
@@ -2582,20 +2944,10 @@ class App:
         pygame.init()
         self.screen = None
         if not self.headless:
-            win_cols = 2 if not getattr(self.args, 'no_top_cam', False) else 1
+            win_cols = 2 if self.telephoto_enabled else 1
             WIN_W, WIN_H = IMG_W * win_cols, IMG_H
             self.screen = pygame.display.set_mode((WIN_W, WIN_H))
             pygame.display.set_caption('Nearestfirst + TL/StopSign | YOLO12n | Sync (OOP)')
-        if not getattr(self.args, 'no_opencv', False) and not self.headless:
-            try:
-                cv2.namedWindow('DEPTH', cv2.WINDOW_NORMAL)
-                cv2.resizeWindow('DEPTH', IMG_W, IMG_H)
-                cv2.moveWindow('DEPTH', 960, 540)
-                cv2.namedWindow('HUD_DIST', cv2.WINDOW_NORMAL)
-                cv2.resizeWindow('HUD_DIST', IMG_W, IMG_H)
-                cv2.moveWindow('HUD_DIST', 0, 540)
-            except Exception:
-                pass
 
     def _close_windows(self):
         try:
@@ -2620,6 +2972,7 @@ class App:
 
         self._init_windows()
         clock = pygame.time.Clock()
+        shutdown_reason = 'running'
         if hasattr(self, '_lead_tracker') and self._lead_tracker is not None:
             self._lead_tracker.reset()
 
@@ -2639,9 +2992,8 @@ class App:
         # One-time startup summary for quick sanity check
         try:
             print(
-                f"Views: top={'ON' if not getattr(self.args, 'no_top_cam', False) else 'OFF'} "
-                f"depth={'ON' if not getattr(self.args, 'no_depth_cam', False) else 'OFF'} "
-                f"opencv={'ON' if not getattr(self.args, 'no_opencv', False) else 'OFF'}"
+                f"Views: telephoto={'ON' if self.telephoto_enabled else 'OFF'} "
+                f"depth={'ON' if not getattr(self.args, 'no_depth_cam', False) else 'OFF'}"
             )
             print(
                 f"NPCs: vehicles={getattr(self.args, 'npc_vehicles', 0)} walkers={getattr(self.args, 'npc_walkers', 0)} "
@@ -2677,8 +3029,8 @@ class App:
             self._log_stereo_cmp = True
             self._stereo_csv_w = stereo_csv_w
         self.sensors = SensorRig(self.world.world, self.world.ego, used_range,
-                                 enable_top=(not getattr(self.args, 'no_top_cam', False)),
-                                 enable_depth=(not getattr(self.args, 'no_depth_cam', False)))
+                                 enable_depth=(not getattr(self.args, 'no_depth_cam', False)),
+                                 enable_telephoto=self.telephoto_enabled)
         if self.args.range_est == 'stereo':
             self.range.ensure_stereo()
 
@@ -2755,21 +3107,30 @@ class App:
         try:
             t0 = time.time()
             while True:
-                frame_id = self.world.tick()
+                try:
+                    frame_id = self.world.tick()
+                except Exception as e:
+                    shutdown_reason = f'world.tick failed: {e}'
+                    raise
                 sim_time += DT
                 self._sim_time = sim_time
                 tic = time.time()
 
-                frames = self.sensors.read(expected_frame=frame_id)
+                try:
+                    frames = self.sensors.read(expected_frame=frame_id)
+                except queue.Empty:
+                    shutdown_reason = 'sensor queue timeout (no new frames)'
+                    break
                 sensor_timestamp = None
                 front_frame = frames.get('front')
                 if front_frame is not None:
                     sensor_timestamp = getattr(front_frame, 'timestamp', None)
                 io = self._read_frames(frames)
                 bgr = io['bgr']
-                img_top = io['img_top']
                 depth_m = io['depth_m']
                 depth_stereo_m = io['depth_stereo_m']
+                tele_bgr = io.get('tele_bgr')
+                tele_depth_m = io.get('tele_depth_m')
 
                 tr = self.world.ego.get_transform()
                 loc = tr.location; rot = tr.rotation
@@ -2806,16 +3167,13 @@ class App:
                             last_sensor_to_act_ms = None
                         pending_actuation = None
 
-                if not getattr(self.args, 'no_opencv', False) and not self.headless:
-                    max_vis = 120.0
-                    vis = np.clip(depth_m / max_vis, 0.0, 1.0)
-                    vis8 = (vis * 255.0).astype(np.uint8)
-                    vis8 = cv2.applyColorMap(vis8, cv2.COLORMAP_PLASMA)
-                    cv2.imshow('DEPTH', vis8)
                 # Perception step (YOLO + depth/stereo + gating)
                 detect_ms = None
                 detect_t0 = time.time()
-                perc = self._perception_step(bgr, depth_m, depth_stereo_m, FX_, FY_, CX_, CY_, sim_time, sensor_timestamp, v, MU, log_both, csv_w)
+                self._frame_index += 1
+                perc = self._perception_step(bgr, depth_m, depth_stereo_m, FX_, FY_, CX_, CY_,
+                                             sim_time, sensor_timestamp, v, MU, log_both, csv_w,
+                                             tele_bgr=tele_bgr, tele_depth_m=tele_depth_m)
                 detect_ms = (time.time() - detect_t0) * 1000.0
                 bgr = perc['bgr']
                 det_points = perc['det_points']
@@ -2856,25 +3214,6 @@ class App:
                             nearest_box = tl_det_box
                             nearest_conf = 0.6 if nearest_conf is None else max(0.6, nearest_conf)
 
-                if not getattr(self.args, 'no_opencv', False) and not self.headless:
-                    hud_dist = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
-                    y_text = 24
-                    mode_label = 'depth camera'
-                    if self.args.range_est == 'pinhole': mode_label = 'pinhole'
-                    elif self.args.range_est == 'stereo': mode_label = 'stereo camera'
-                    cv2.putText(hud_dist, f'Ego→Object distances ({mode_label}, meters):', (10, y_text),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                    y_text += 28
-                    det_points.sort(key=lambda d: d['z'])
-                    if det_points:
-                        for d in det_points[:22]:
-                            xcam, ycam, zcam = d['xyz']
-                            cv2.putText(hud_dist, f"{d['name']:<14}  Z={zcam:5.1f} m   X={xcam:+4.1f} m   Y={ycam:+4.1f} m",
-                                        (10, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 255, 0), 1)
-                            y_text += 22
-                    else:
-                        cv2.putText(hud_dist, 'No detections', (10, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180,180,180), 1)
-                    cv2.imshow('HUD_DIST', hud_dist)
                 if stop_detected_current: stop_persist_count += 1
                 else: stop_persist_count = 0
                 if (not stop_armed) and (stop_persist_count >= self.args.persist_frames):
@@ -3178,12 +3517,18 @@ class App:
 
                 collision_flag = bool(getattr(self.world, 'collision_happened', False))
                 if not self.headless:
-                    self._draw_hud(self.screen, bgr, img_top, perf_fps, perf_ms, x, y, z, yaw, compass,
+                    mode_label = 'depth camera'
+                    if self.args.range_est == 'pinhole': mode_label = 'pinhole'
+                    elif self.args.range_est == 'stereo': mode_label = 'stereo camera'
+                    elif self.args.range_est == 'both': mode_label = 'depth + pinhole log'
+                    self._draw_hud(self.screen, bgr, perf_fps, perf_ms, x, y, z, yaw, compass,
                                    frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
                                    hold_reason, no_trigger_elapsed, no_red_elapsed, stop_armed,
                                    stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
                                    dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target,
-                                   collision_flag, dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime)
+                                   collision_flag, det_points, mode_label,
+                                   dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime,
+                                   tele_bgr)
 
                 # Periodic concise console log for tuning
                 logN = int(getattr(self.args, 'log_interval_frames', 0) or 0)
@@ -3234,15 +3579,15 @@ class App:
                 ema_loop_ms = 0.9*ema_loop_ms + 0.1*loop_ms
                 loop_ms_max = max(loop_ms_max, loop_ms)
                 v_prev = v
-                if not getattr(self.args, 'no_opencv', False) and not self.headless:
-                    cv2.waitKey(1)
 
                 if not self.headless:
                     for e in pygame.event.get():
                         if e.type == pygame.QUIT:
+                            shutdown_reason = 'pygame QUIT event'
                             raise KeyboardInterrupt
                         elif e.type == pygame.KEYDOWN:
                             if e.key == pygame.K_ESCAPE:
+                                shutdown_reason = 'ESC pressed'
                                 raise KeyboardInterrupt
                             elif e.key == pygame.K_LEFTBRACKET:
                                 self.detector.conf_thr = max(0.05, round(self.detector.conf_thr - 0.05, 2))
@@ -3291,9 +3636,17 @@ class App:
                         pass
                 clock.tick(int(1.0/DT))
         except KeyboardInterrupt:
-            pass
+            if shutdown_reason == 'running':
+                shutdown_reason = 'KeyboardInterrupt'
+        except Exception as e:
+            shutdown_reason = f'unhandled exception: {e.__class__.__name__}: {e}'
+            traceback.print_exc()
         finally:
             t0 = time.time()
+            try:
+                print(f'[SHUTDOWN] Reason: {shutdown_reason}')
+            except Exception:
+                pass
             try:
                 print('[SHUTDOWN] Closing windows...')
                 self._close_windows()
@@ -3325,6 +3678,15 @@ class App:
             if self.scenario_logger is not None:
                 try:
                     self.scenario_logger.close()
+                except Exception:
+                    pass
+            try:
+                self._maybe_write_telephoto_compute_summary()
+            except Exception:
+                pass
+            if self.telephoto_compute_fp is not None:
+                try:
+                    self.telephoto_compute_fp.close()
                 except Exception:
                     pass
             if self.video_writer is not None:
@@ -3384,13 +3746,22 @@ def parse_args():
                         help='ROI shrink factor (0..0.9) when sampling stereo disparity depth')
     # Visualization toggles
     parser.add_argument('--no-depth-viz', action='store_true',
-                        help='Hide the DEPTH/HUD_DIST OpenCV windows (alias for --no-opencv)')
+                        help='(Deprecated) Legacy alias for --no-opencv; OpenCV windows are no longer used')
     parser.add_argument('--no-opencv', action='store_true',
-                        help='Disable OpenCV windows entirely (depth/HUD_DIST)')
+                        help='(Deprecated) No effect now that depth/HUD HUD_DIST windows render inside pygame')
     parser.add_argument('--no-top-cam', action='store_true',
                         help='Disable spawning the top view camera and hide it from the HUD')
     parser.add_argument('--no-depth-cam', action='store_true',
                         help='Disable spawning the depth camera (range_est depth will be auto-fallback)')
+    parser.add_argument('--no-telephoto', action='store_true',
+                        help='Disable the telephoto traffic-light helper camera and detector scheduling')
+    parser.add_argument('--telephoto-stride', type=int, default=TELEPHOTO_STRIDE_DEFAULT,
+                        help='Run telephoto YOLO inference every N frames (>=2). Default=3')
+    parser.add_argument('--telephoto-zoom', type=float, default=TELEPHOTO_DIGITAL_ZOOM_DEFAULT,
+                        help='Digital zoom factor (>=1.0) for the telephoto feed (crop upper-center, resize, reuse boxes).'
+                             ' Default=1.5; set to 1.0 to disable')
+    parser.add_argument('--telephoto-compute-log', type=str, default=None,
+                        help='Optional CSV path to log total compute time with/without telephoto assists (plus cache/skip stats)')
     parser.add_argument('--headless', action='store_true',
                         help='Run without GUI windows (also disables OpenCV windows)')
 
