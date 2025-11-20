@@ -1,5 +1,5 @@
 from __future__ import print_function
-import os, sys, math, argparse, random, queue, glob, csv
+import os, sys, math, random, queue, csv, multiprocessing as mp
 import time, traceback
 from typing import Optional, Tuple, List, Dict, Any
 from collections import deque, Counter
@@ -8,750 +8,105 @@ import numpy as np
 import pygame
 import cv2
 
-# Ensure CARLA Python egg is on sys.path before importing carla (supports common layouts)
-try:
-    import carla  # type: ignore
-except Exception:
-    try:
-        this_dir = os.path.dirname(os.path.abspath(__file__))
-        candidates = []
-        patterns = [
-            os.path.join(this_dir, '..', 'carla', 'dist', 'carla-*.egg'),
-            os.path.join(this_dir, '..', '..', 'PythonAPI', 'carla', 'dist', 'carla-*.egg'),
-            os.path.join(this_dir, '..', 'dist', 'carla-*.egg'),
-        ]
-        for p in patterns:
-            candidates.extend(glob.glob(p))
-        # Prefer the first candidate; append to sys.path if found
-        if candidates:
-            sys.path.append(os.path.normpath(candidates[0]))
-        import carla  # retry
-    except Exception:
-        # Leave import error to be handled at runtime if CARLA egg is missing
-        raise
-
-try:
-    from ultralytics import YOLO as _ULTRA_YOLO  # type: ignore
-except Exception:
-    _ULTRA_YOLO = None
-
-import torch 
-
-# ===================== configuration =====================
-IMG_W, IMG_H      = 960, 540          # display pane size for primary/telephoto views
-FOV_X_DEG         = 90.0              # front cam horizontal FOV
-TELEPHOTO_IMG_W   = 640
-TELEPHOTO_IMG_H   = 360
-TELEPHOTO_FOV_X_DEG = 25.0
-TELEPHOTO_STRIDE_DEFAULT = 3
-TELEPHOTO_CACHE_MAX_AGE_S = 0.6
-TELEPHOTO_DIGITAL_ZOOM_DEFAULT = 1.5
-TELEPHOTO_DIGITAL_ZOOM_MAX = 3.5
-TELEPHOTO_ZOOM_TOP_BIAS = 0.35
-TL_PRIMARY_CROP_FRAC = 0.20
-TL_PRIMARY_SHORT_RANGE_M = 50.0
-TL_STATE_SMOOTHING_FRAMES = 5
-DT                = 0.02              # 50 Hz (set 0.02 for lower latency)
-FX                = (IMG_W / 2.0) / math.tan(math.radians(FOV_X_DEG / 2.0))
-
-# Stereo camera baseline (meters)
-STEREO_BASELINE_M = 0.54
-
-# Lane gating (ignore other-lane vehicles)
-LANE_HALF_WIDTH   = 1.8
-LATERAL_MARGIN    = 0.6
-LATERAL_MAX       = LANE_HALF_WIDTH + LATERAL_MARGIN
-
-# Cruise / braking
-A_MAX             = 8.0               # hard cap
-B_COMFORT         = 3.5               # map a_des -> [0..1] brake
-V_TARGET          = 10.0              # m/s default target
-KP_THROTTLE       = 0.15
-EPS               = 0.5
-ALPHA_VBLEND      = 0.7               # blend velocity estimates
-S_ENGAGE          = 80.0              # generic engage for vehicles/unknown
-S_ENGAGE_TL       = 55.0              # traffic‑light engage distance (red)
-S_ENGAGE_PED      = 45.0              # pedestrian engage distance
-V_STOP            = 0.10
-V_AEB_MIN_DEFAULT = 2.5               # minimum speed for obstacle-triggered AEB
-GATE_CONFIRM_FRAMES_DEFAULT = 3       # frames of gate_hit before AEB entry
-TTC_CONFIRM_S_DEFAULT = 2.5           # TTC threshold for obstacle confirmation
-TTC_STAGE_STRONG_DEFAULT = 1.8        # TTC where controller escalates to strong braking
-TTC_STAGE_FULL_DEFAULT   = 1.0        # TTC where controller escalates to full AEB
-
-# Multi-stage AEB shaping (fraction of μg cap)
-BRAKE_STAGE_COMFORT_FACTOR = 0.45
-BRAKE_STAGE_STRONG_FACTOR  = 0.75
-BRAKE_STAGE_FULL_FACTOR    = 1.00
-AEB_RAMP_UP_DEFAULT        = 12.0     # max increase in a_des (m/s^2) per second
-AEB_RAMP_DOWN_DEFAULT      = 18.0     # max decrease in a_des (m/s^2) per second
-
-# Clear timers (per reason)
-CLEAR_DELAY_OBS   = 0.9               # obstacle clear debounce
-CLEAR_DELAY_RED   = 0.5               # GREEN debounce to clear red‑light hold
-CLEAR_DELAY_S     = 3.0               # legacy/general; still used for HUD counters
-STOP_WAIT_S       = 5.0               # stop‑sign wait
-KICK_SEC          = 0.6               # start "kick"
-KICK_THR          = 0.25
-
-# Dynamic safety tuning knobs (match original)
-TAU_MIN, TAU_MAX  = 0.15, 1.50
-K_LAT_TAU         = 1.2    # sec/sec of pipeline latency
-K_MU_TAU          = 0.25   # extra tau per (0.9 - mu)
-K_UNC_TAU         = 0.35   # extra tau per (1 - conf)
-
-D_MIN, D_MAX      = 3.0, 35.0   # meters
-K_LAT_D           = 1.0         # meters per v*latency (reaction dist)
-K_UNC_D           = 4.0         # meters per 1 m of depth sigma
-K_MU_D            = 4.0         # meters per (0.9 - mu)
-
-# Brake PI shaping (measured decel tracking) — original-ish gains
-KPB               = 0.22
-KIB               = 0.10
-I_MAX             = 8.0
-
-# Road / tire friction & low‑μ helpers
-MU_DEFAULT        = 0.90
-REV_PULSE_V_MAX   = 2.0
-REV_THR           = 0.18
-ABS_V_MAX         = 4.0
-ABS_B_MIN         = 0.20
-ABS_PWM_SCALE     = 0.5
-
-# Slip controller defaults (per-wheel PI + μ adaptation)
-FRICTION_CONFIGS = {
-    'high':   {'lambda_star': 0.18, 'kp': 5.0, 'ki': 25.0},
-    'medium': {'lambda_star': 0.15, 'kp': 4.0, 'ki': 20.0},
-    'low':    {'lambda_star': 0.10, 'kp': 3.0, 'ki': 12.0},
-}
-
-# False-stop heuristics for telemetry/episode labeling
-FALSE_STOP_MARGIN_M = 5.0      # if actual gap exceeds safety distance by this margin while braking → suspicious
-FALSE_STOP_TTC_S    = 4.0      # TTC above this while brake engaged → likely false stop
-
-# Actuation-latency measurement thresholds
-ACTUATION_BRAKE_CMD_MIN   = 0.18   # require brake command above this before timing
-ACTUATION_DECEL_THRESH    = 0.8    # m/s^2 decel magnitude that counts as "brake is biting"
-ACTUATION_TIMEOUT_S       = 1.5    # give up if no response within this horizon
-
-
-def compute_slip_per_wheel(v_ego: float, wheel_speeds: List[float]) -> List[float]:
-    """Return longitudinal slip λ for each wheel in [0, 1]."""
-
-    v = max(0.1, float(v_ego))
-    slips: List[float] = []
-    for v_w in wheel_speeds:
-        try:
-            v_w = max(0.0, float(v_w))
-        except Exception:
-            v_w = 0.0
-        lam = (v - v_w) / v
-        lam = max(0.0, min(1.0, lam))
-        slips.append(lam)
-    return slips
-
-
-class PISlipChannel:
-    def __init__(self, dt: float,
-                 lambda_star: float = 0.15,
-                 kp: float = 4.0,
-                 ki: float = 20.0):
-        self.dt = dt
-        self.lambda_star = lambda_star
-        self.kp = kp
-        self.ki = ki
-        self.I = 0.0
-        self.f = 1.0
-
-    def reset(self):
-        self.I = 0.0
-        self.f = 1.0
-
-    def step(self, lam: float) -> float:
-        e = float(self.lambda_star) - float(max(0.0, min(1.0, lam)))
-        u_raw = self.kp * e + self.I
-        f_unsat = u_raw
-        f_sat = max(0.0, min(1.0, f_unsat))
-        if (f_unsat > 1.0 and e > 0.0) or (f_unsat < 0.0 and e < 0.0):
-            pass
-        else:
-            self.I += self.ki * e * self.dt
-        self.f = f_sat
-        return self.f
-
-
-class FrictionEstimator:
-    def __init__(self, g: float = 9.81, alpha: float = 0.05, mu_init: float = 0.8):
-        self.g = g
-        self.alpha = alpha
-        self.mu_est = mu_init
-
-    def reset(self):
-        self.mu_est = 0.8
-
-    def update(self, v_ego: float, lambda_max: float, a_long: float, brake_req: float):
-        if v_ego < 5.0:
-            return
-        if brake_req < 0.3:
-            return
-        if lambda_max < 0.10 or lambda_max > 0.25:
-            return
-        if not math.isfinite(a_long):
-            return
-        mu_inst = abs(a_long) / self.g
-        mu_inst = max(0.01, min(1.5, mu_inst))
-        self.mu_est = (1.0 - self.alpha) * self.mu_est + self.alpha * mu_inst
-
-    def regime(self) -> str:
-        mu = self.mu_est
-        if mu > 0.8:
-            return 'high'
-        if mu > 0.4:
-            return 'medium'
-        return 'low'
-
-
-class PISlipABSActuator:
-    def __init__(self, dt: float,
-                 lambda_star: float = 0.15,
-                 kp: float = 4.0,
-                 ki: float = 20.0,
-                 v_min_abs: float = 3.0,
-                 wheel_count: int = 4):
-        self.dt = dt
-        self.v_min_abs = v_min_abs
-        self.channels = [PISlipChannel(dt, lambda_star, kp, ki) for _ in range(wheel_count)]
-        self.last_lambda_max = 0.0
-        self.last_f_global = 1.0
-
-    def reset(self):
-        for ch in self.channels:
-            ch.reset()
-        self.last_lambda_max = 0.0
-        self.last_f_global = 1.0
-
-    def _eligible(self, v_ego: float, wheel_speeds: List[float]) -> bool:
-        return v_ego >= self.v_min_abs and len(wheel_speeds) == len(self.channels)
-
-    def step(self, brake_req: float, v_ego: float, wheel_speeds: List[float], a_long: float = 0.0) -> float:
-        del a_long  # unused in fixed-mode actuator
-        brake_req = max(0.0, min(1.0, float(brake_req)))
-        if not self._eligible(v_ego, wheel_speeds):
-            self.last_lambda_max = 0.0
-            self.last_f_global = 1.0
-            for ch in self.channels:
-                ch.reset()
-            return brake_req
-        slips = compute_slip_per_wheel(v_ego, wheel_speeds)
-        self.last_lambda_max = max(slips) if slips else 0.0
-        f_list = [ch.step(lam) for ch, lam in zip(self.channels, slips)]
-        f_global = min(f_list) if f_list else 1.0
-        self.last_f_global = f_global
-        return brake_req * f_global
-
-    def debug_metrics(self) -> Dict[str, Any]:
-        return {
-            'lambda_max': self.last_lambda_max,
-            'f_global': self.last_f_global,
-            'mu_est': None,
-            'regime': 'fixed',
-        }
-
-
-class AdaptivePISlipABSActuator(PISlipABSActuator):
-    def __init__(self, dt: float, v_min_abs: float = 3.0,
-                 wheel_count: int = 4,
-                 friction_configs: Optional[Dict[str, Dict[str, float]]] = None):
-        super().__init__(dt, v_min_abs=v_min_abs, wheel_count=wheel_count)
-        self.friction = FrictionEstimator()
-        self.friction_configs = friction_configs if friction_configs is not None else FRICTION_CONFIGS
-        self.current_regime = 'medium'
-        self._apply_friction_config(self.current_regime)
-
-    def _apply_friction_config(self, regime: str):
-        cfg = self.friction_configs.get(regime, self.friction_configs['medium'])
-        for ch in self.channels:
-            ch.lambda_star = cfg['lambda_star']
-            ch.kp = cfg['kp']
-            ch.ki = cfg['ki']
-            ch.reset()
-        self.current_regime = regime
-
-    def reset(self):
-        super().reset()
-        self.friction.reset()
-        self._apply_friction_config('medium')
-
-    def step(self, brake_req: float, v_ego: float, wheel_speeds: List[float], a_long: float = 0.0) -> float:
-        brake_req = max(0.0, min(1.0, float(brake_req)))
-        if not self._eligible(v_ego, wheel_speeds):
-            self.last_lambda_max = 0.0
-            self.last_f_global = 1.0
-            for ch in self.channels:
-                ch.reset()
-            return brake_req
-        slips = compute_slip_per_wheel(v_ego, wheel_speeds)
-        lambda_max = max(slips) if slips else 0.0
-        self.last_lambda_max = lambda_max
-        self.friction.update(v_ego, lambda_max, a_long, brake_req)
-        regime = self.friction.regime()
-        if regime != self.current_regime:
-            self._apply_friction_config(regime)
-        f_list = [ch.step(lam) for ch, lam in zip(self.channels, slips)]
-        f_global = min(f_list) if f_list else 1.0
-        self.last_f_global = f_global
-        return brake_req * f_global
-
-    def debug_metrics(self) -> Dict[str, Any]:
-        return {
-            'lambda_max': self.last_lambda_max,
-            'f_global': self.last_f_global,
-            'mu_est': self.friction.mu_est,
-            'regime': self.current_regime,
-        }
-
-
-class LeadKalmanTracker:
-    """Single-target constant-velocity Kalman filter for lead obstacle distance."""
-
-    def __init__(self, dt: float,
-                 process_var: float = 8.0,
-                 meas_var: float = 4.0,
-                 max_miss_s: float = 0.6,
-                 reset_jump_m: float = 12.0,
-                 min_iou_keep: float = 0.15):
-        self.dt = dt
-        self.process_var = process_var
-        self.meas_var = meas_var
-        self.max_miss_s = max(0.0, max_miss_s)
-        self.reset_jump_m = reset_jump_m
-        self.min_iou_keep = min_iou_keep
-        self.reset()
-
-    def reset(self):
-        self.active = False
-        self.x = np.zeros((2, 1), dtype=float)
-        self.P = np.eye(2, dtype=float)
-        self.box: Optional[Tuple[int, int, int, int]] = None
-        self.kind: Optional[str] = None
-        self.state_time: Optional[float] = None
-        self.last_meas_time: Optional[float] = None
-
-    def deactivate(self):
-        self.reset()
-
-    def _predict_to(self, target_time: Optional[float]):
-        if not self.active:
-            self.state_time = target_time
-            return
-        if target_time is None:
-            return
-        if self.state_time is None:
-            self.state_time = target_time
-            return
-        dt = float(target_time) - float(self.state_time)
-        if not math.isfinite(dt):
-            return
-        if dt < 0.0:
-            self.state_time = target_time
-            return
-        if dt < 1e-6:
-            self.state_time = target_time
-            return
-        F = np.array([[1.0, dt], [0.0, 1.0]])
-        q = self.process_var
-        Q = np.array([[0.25 * dt**4, 0.5 * dt**3],
-                      [0.5 * dt**3, dt**2]], dtype=float) * q
-        self.x = F @ self.x
-        self.P = F @ self.P @ F.T + Q
-        self.state_time = target_time
-
-    def _kalman_update(self, z: float):
-        H = np.array([[1.0, 0.0]])
-        R = np.array([[self.meas_var]])
-        z_vec = np.array([[z]])
-        y = z_vec - H @ self.x
-        S = H @ self.P @ H.T + R
-        if S.shape == (1, 1):
-            inv_S = 1.0 / float(S[0, 0]) if S[0, 0] != 0 else 0.0
-        else:
-            inv_S = np.linalg.pinv(S)
-        K = self.P @ H.T * inv_S
-        self.x = self.x + K @ y
-        I = np.eye(self.P.shape[0])
-        self.P = (I - K @ H) @ self.P
-
-    def step(self, sim_time: float,
-             measurement: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
-        if measurement is not None:
-            dist = measurement.get('distance')
-            if dist is not None and math.isfinite(dist):
-                dist = float(dist)
-                meas_ts = measurement.get('timestamp')
-                if meas_ts is None or not math.isfinite(meas_ts):
-                    meas_ts = sim_time
-                box = measurement.get('box')
-                kind = measurement.get('kind')
-                if not self.active:
-                    self.active = True
-                    self.x = np.array([[dist], [0.0]], dtype=float)
-                    self.P = np.eye(2, dtype=float) * 5.0
-                    self.box = box
-                    self.kind = kind
-                    self.state_time = meas_ts
-                    self.last_meas_time = meas_ts
-                else:
-                    self._predict_to(meas_ts)
-                    pred_dist = float(self.x[0, 0])
-                    same_kind = (self.kind is None or kind is None or self.kind == kind)
-                    overlap = iou_xywh(self.box, box) if (self.box is not None and box is not None) else 0.0
-                    if (abs(dist - pred_dist) > self.reset_jump_m and overlap < self.min_iou_keep) or (not same_kind and overlap < self.min_iou_keep):
-                        self.x = np.array([[dist], [0.0]], dtype=float)
-                        self.P = np.eye(2, dtype=float) * 5.0
-                        self.box = box
-                        self.kind = kind
-                        self.state_time = meas_ts
-                        self.last_meas_time = meas_ts
-                    else:
-                        self._kalman_update(dist)
-                        self.box = box if box is not None else self.box
-                        self.kind = kind if kind is not None else self.kind
-                        self.last_meas_time = meas_ts
-                        self.state_time = meas_ts
-        if not self.active:
-            return None
-        if (self.last_meas_time is not None) and ((sim_time - self.last_meas_time) > self.max_miss_s):
-            self.reset()
-            return None
-        self._predict_to(sim_time)
-        if (self.last_meas_time is not None) and ((sim_time - self.last_meas_time) > self.max_miss_s):
-            self.reset()
-            return None
-        return {
-            'distance': float(self.x[0, 0]),
-            'rate': float(self.x[1, 0]),
-            'age': None if self.last_meas_time is None else float(sim_time - self.last_meas_time),
-        }
-
-
-class LeadMultiObjectTracker:
-    """Maintain multiple Kalman tracks with ID assignments for lead selection."""
-
-    def __init__(self, dt: float,
-                 max_tracks: int = 4,
-                 assoc_iou_min: float = 0.2,
-                 tracker_kwargs: Optional[Dict[str, Any]] = None):
-        self.dt = dt
-        self.max_tracks = max(1, int(max_tracks))
-        self.assoc_iou_min = max(0.0, float(assoc_iou_min))
-        self._tracker_kwargs = tracker_kwargs or {}
-        self._tracks: Dict[int, LeadKalmanTracker] = {}
-        self._track_meta: Dict[int, Dict[str, Any]] = {}
-        self._next_id = 1
-
-    def reset(self):
-        for tracker in self._tracks.values():
-            tracker.reset()
-        self._tracks.clear()
-        self._track_meta.clear()
-        self._next_id = 1
-
-    def deactivate(self):
-        self.reset()
-
-    def _new_tracker(self) -> LeadKalmanTracker:
-        return LeadKalmanTracker(dt=self.dt, **self._tracker_kwargs)
-
-    def _assoc_score(self, track_id: int, measurement: Dict[str, Any]) -> float:
-        tracker = self._tracks.get(track_id)
-        if tracker is None:
-            return 0.0
-        overlap = iou_xywh(getattr(tracker, 'box', None), measurement.get('box'))
-        if overlap < self.assoc_iou_min:
-            return 0.0
-        score = overlap
-        kind = measurement.get('kind')
-        if tracker.kind is not None and kind is not None and tracker.kind == kind:
-            score += 0.2
-        dist = measurement.get('distance')
-        if dist is not None and tracker.active:
-            try:
-                pred = float(tracker.x[0, 0])
-                score += max(0.0, 1.0 - abs(pred - float(dist)) / max(1.0, float(dist)))
-            except Exception:
-                pass
-        return score
-
-    def _ensure_capacity(self):
-        if len(self._tracks) < self.max_tracks:
-            return
-        if not self._tracks:
-            return
-        far_id = None
-        far_dist = -1.0
-        for tid, tracker in self._tracks.items():
-            try:
-                dist = float(tracker.x[0, 0])
-            except Exception:
-                dist = 1e9
-            if dist > far_dist:
-                far_dist = dist
-                far_id = tid
-        if far_id is not None:
-            self._tracks.pop(far_id, None)
-            self._track_meta.pop(far_id, None)
-
-    def step(self, sim_time: float, measurements: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
-        measurements_sorted = sorted(measurements or [], key=lambda m: m.get('distance', 1e9))
-        assignments: Dict[int, Dict[str, Any]] = {}
-        unmatched: List[Dict[str, Any]] = []
-        for meas in measurements_sorted:
-            best_track = None
-            best_score = 0.0
-            for track_id in self._tracks.keys():
-                if track_id in assignments:
-                    continue
-                score = self._assoc_score(track_id, meas)
-                if score > best_score:
-                    best_score = score
-                    best_track = track_id
-            if best_track is not None:
-                assignments[best_track] = meas
-            else:
-                unmatched.append(meas)
-
-        active_states: List[Dict[str, Any]] = []
-        to_remove: List[int] = []
-        for track_id, tracker in list(self._tracks.items()):
-            meas = assignments.get(track_id)
-            state = tracker.step(sim_time, meas)
-            if state is None:
-                if not tracker.active:
-                    to_remove.append(track_id)
-                continue
-            meta = self._track_meta.setdefault(track_id, {})
-            meta['kind'] = tracker.kind
-            meta['box'] = tracker.box
-            active_states.append({
-                'track_id': track_id,
-                'distance': state.get('distance'),
-                'rate': state.get('rate'),
-                'age': state.get('age'),
-                'kind': tracker.kind,
-                'box': tracker.box,
-            })
-        for tid in to_remove:
-            self._tracks.pop(tid, None)
-            self._track_meta.pop(tid, None)
-
-        for meas in unmatched:
-            self._ensure_capacity()
-            tracker = self._new_tracker()
-            state = tracker.step(sim_time, meas)
-            if state is None:
-                continue
-            track_id = self._next_id
-            self._next_id += 1
-            self._tracks[track_id] = tracker
-            self._track_meta[track_id] = {'kind': tracker.kind, 'box': tracker.box}
-            active_states.append({
-                'track_id': track_id,
-                'distance': state.get('distance'),
-                'rate': state.get('rate'),
-                'age': state.get('age'),
-                'kind': tracker.kind,
-                'box': tracker.box,
-            })
-
-        active_states.sort(key=lambda s: (float('inf') if s.get('distance') is None else float(s['distance'])))
-        best_state = active_states[0] if active_states else None
-        return best_state, active_states
-
-    def active_track_count(self) -> int:
-        return len(self._tracks)
-
-
-# Detection (YOLO specific)
-YOLO_MODEL_PATH   = 'yolo12n.pt'     # path to YOLO12n weights
-CONF_THR_DEFAULT  = 0.45
-NMS_THR           = 0.45
-H_MIN_PX          = 10
-CENTER_BAND_FRAC  = 0.35
-
-# Classes of interest (trigger names)
-VEHICLE_CLASSES     = {'car','bus','truck','motorcycle','motorbike','bicycle','train'}
-PEDESTRIAN_CLASSES  = {'person'}
-TRIGGER_CLASSES     = VEHICLE_CLASSES | {'traffic light','stop sign'} | PEDESTRIAN_CLASSES
-
-# Approx real heights (meters) for monocular pinhole
-OBJ_HEIGHT_M = {
-    'person': 1.70,
-    'car': 1.50,
-    'traffic light': 2.20,
-    'bus': 3.00,
-    'truck': 3.20,
-    'motorcycle': 1.40,
-    'motorbike': 1.40,
-    'bicycle': 1.40,
-    'train': 3.50,
-    'stop sign': 0.75,
-}
-
-# Debug toggle for traffic light mask visualization (kept)
-DEBUG_TL = True
-
-# Depth / stereo ROI + fusion defaults
-DEPTH_ROI_SHRINK_DEFAULT   = 0.40
-STEREO_ROI_SHRINK_DEFAULT  = 0.30
-STEREO_FUSE_NEAR_WEIGHT    = 0.75  # close objects -> trust depth camera more
-STEREO_FUSE_FAR_WEIGHT     = 0.45  # far objects -> lean slightly toward stereo
-STEREO_FUSE_DISAGREE_M     = 12.0  # beyond this delta, pick the safer (closer) estimate
-
-
-class BaseDetector:
-    """Minimal detector interface so we can swap YOLO, SSD, etc.
-
-    Implementors must provide predict_raw(bgr) -> (classIds, confs, boxes).
-    """
-
-    def predict_raw(self, bgr: np.ndarray):
-        raise NotImplementedError
-
-# ---------- label normalization ----------
-def _norm_label(s: str) -> str:
-    return ''.join(ch for ch in s.lower() if ch.isalpha())  # 'traffic light' -> 'trafficlight'
-
-TRIGGER_NAMES_NORM = {
-    'trafficlight','stopsign','person','car','bus','truck','motorcycle','motorbike','bicycle','train'
-}
-
-# ---- per-class confidence parser ----
-# Format: "traffic light:0.55, stop sign:0.45, person:0.40"
-# Names are case-insensitive; spaces allowed; we normalize like _norm_label
-# If a class isn't listed, it falls back to detector.conf_thr
-
-def parse_per_class_conf_map(spec: Optional[str]) -> Dict[str, float]:
-    mapping: Dict[str, float] = {}
-    if not spec:
-        return mapping
-    for tok in str(spec).split(','):
-        tok = tok.strip()
-        if not tok or ':' not in tok:
-            continue
-        k, v = tok.split(':', 1)
-        k = _norm_label(k.strip())
-        try:
-            mapping[k] = float(v.strip())
-        except Exception:
-            pass
-    return mapping
-
-# ---- generic per-class float/int maps for other overrides ----
-
-def _parse_float_map(spec: Optional[str]) -> Dict[str, float]:
-    mapping: Dict[str, float] = {}
-    if not spec:
-        return mapping
-    for tok in str(spec).split(','):
-        tok = tok.strip()
-        if not tok or ':' not in tok:
-            continue
-        k, v = tok.split(':', 1)
-        k = _norm_label(k.strip())
-        try:
-            mapping[k] = float(v.strip())
-        except Exception:
-            pass
-    return mapping
-
-def _parse_int_map(spec: Optional[str]) -> Dict[str, int]:
-    mapping: Dict[str, int] = {}
-    if not spec:
-        return mapping
-    for tok in str(spec).split(','):
-        tok = tok.strip()
-        if not tok or ':' not in tok:
-            continue
-        k, v = tok.split(':', 1)
-        k = _norm_label(k.strip())
-        try:
-            mapping[k] = int(float(v.strip()))
-        except Exception:
-            pass
-    return mapping
-
-# ---- per-class IoU (NMS) parser ----
-# Format: "traffic light:0.40, person:0.55" -> IoU thresholds per class for a second-stage NMS
-
-def parse_per_class_iou_map(spec: Optional[str]) -> Dict[str, float]:
-    mapping: Dict[str, float] = {}
-    if not spec:
-        return mapping
-    for tok in str(spec).split(','):
-        tok = tok.strip()
-        if not tok or ':' not in tok:
-            continue
-        k, v = tok.split(':', 1)
-        k = _norm_label(k.strip())
-        try:
-            mapping[k] = float(v.strip())
-        except Exception:
-            pass
-    return mapping
-
-# ---- per-class engage distance parser ----
-# Format: "person:45, traffic light:55, car:80, stopsign:80"
-
-def parse_engage_override_map(spec: Optional[str]) -> Dict[str, float]:
-    mapping: Dict[str, float] = {}
-    if not spec:
-        return mapping
-    for tok in str(spec).split(','):
-        tok = tok.strip()
-        if not tok or ':' not in tok:
-            continue
-        k, v = tok.split(':', 1)
-        k = _norm_label(k.strip())
-        try:
-            mapping[k] = float(v.strip())
-        except Exception:
-            pass
-    return mapping
-
-# ---- per-class minimum box height (px) ----
-
-def parse_min_h_override_map(spec: Optional[str]) -> Dict[str, int]:
-    return _parse_int_map(spec)
-
-# ---- per-class center-band fraction (0..1 of IMG_W) ----
-
-def parse_gate_frac_override_map(spec: Optional[str]) -> Dict[str, float]:
-    return _parse_float_map(spec)
-
-# ---- per-class lateral max (meters) ----
-
-def parse_gate_lateral_override_map(spec: Optional[str]) -> Dict[str, float]:
-    return _parse_float_map(spec)
+from calibrations import load_aeb_calibration, load_bus_calibration, load_safety_calibration
+from ecu import (
+    ActuationECU,
+    ActuationJob,
+    DistributedECUPipeline,
+    MessageBus,
+    PerceptionECU,
+    PerceptionJob,
+    PlanningECU,
+    PlanningJob,
+    SafetyManager,
+)
+from abs_system import AdaptivePISlipABSActuator, PISlipABSActuator
+from tracking_system import LeadMultiObjectTracker
+from telemetry import _ScenarioLogger, _TelemetryLogger
+from config import *  # noqa: F401,F403
+from label_utils import (
+    TRIGGER_NAMES_NORM,
+    _norm_label,
+    parse_engage_override_map,
+    parse_gate_frac_override_map,
+    parse_gate_lateral_override_map,
+    parse_min_h_override_map,
+    parse_per_class_conf_map,
+    parse_per_class_iou_map,
+)
+from detectors import BaseDetector, YOLODetector, CONF_THR_DEFAULT, NMS_THR
+from cli_parser import parse_args, apply_preset
+from camera_utils import (
+    bgr_to_pygame_surface,
+    carla_image_to_surface,
+    decode_depth_meters_from_bgra,
+    fov_y_from_x,
+    intrinsics_from_fov,
+    pixel_to_camera,
+)
+from carla_utils import import_carla
+from ego_state import EgoState
+from range_estimator import RangeEstimator
+from sensor_rig import SensorRig
+from world_manager import WorldManager
+
+carla = import_carla()
+
+from functools import partial
+
+
+def _perception_job_handler(ecu: PerceptionECU, job: PerceptionJob) -> Any:
+    return ecu.process(
+        job.bgr,
+        job.depth_m,
+        job.depth_stereo_m,
+        job.fx,
+        job.fy,
+        job.cx,
+        job.cy,
+        job.sim_time,
+        job.sensor_timestamp,
+        job.v,
+        job.mu,
+        job.log_both,
+        job.csv_writer,
+        tele_bgr=job.tele_bgr,
+        tele_depth_m=job.tele_depth_m,
+    )
+
+
+def _planning_job_handler(ecu: PlanningECU, job: PlanningJob) -> PlanningDecision:
+    return ecu.plan(
+        job.trigger_name,
+        job.nearest_s_active,
+        job.nearest_thr,
+        job.tl_state,
+        job.tl_s_active,
+        job.v,
+        job.v_target,
+        job.mu,
+        job.ema_loop_ms,
+        job.tracked_distance_for_control,
+        job.stop_armed,
+        job.stop_latch_time,
+        job.stop_release_ignore_until,
+        job.red_green_since,
+        job.no_trigger_elapsed,
+        job.no_red_elapsed,
+        job.depth_m,
+        job.depth_stereo_m,
+        job.nearest_box,
+        job.nearest_conf,
+        job.I_err,
+        job.v_prev,
+    )
+
+
+def _actuation_job_handler(ecu: ActuationECU, job: ActuationJob) -> ActuationResult:
+    return ecu.apply_abs(job.brake_cmd, job.v_ego, job.wheel_speeds, job.a_long)
 
 
 # ===================== helpers =====================
-def fov_y_from_x(width: int, height: int, fov_x_deg: float) -> float:
-    fov_x = math.radians(fov_x_deg)
-    return 2.0 * math.atan((height / width) * math.tan(fov_x / 2.0))
-
-def focal_length_y_px(width: int, height: int, fov_x_deg: float) -> float:
-    fovy = fov_y_from_x(width, height, fov_x_deg)
-    return (height / 2.0) / math.tan(fovy / 2.0)
-
-def bgr_to_pygame_surface(bgr: np.ndarray) -> pygame.Surface:
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    return pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
-
-def carla_image_to_surface(image) -> pygame.Surface:
-    arr = np.frombuffer(image.raw_data, dtype=np.uint8).reshape((image.height, image.width, 4))
-    rgb = arr[:, :, :3][:, :, ::-1]  # BGRA->RGB
-    return pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
-
 def wrap_pi(a: float) -> float:
     while a >  math.pi: a -= 2*math.pi
     while a < -math.pi: a += 2*math.pi
@@ -763,58 +118,12 @@ def yaw_to_compass(yaw_deg: float) -> str:
     idx = int((y + 22.5) // 45)
     return dirs[idx]
 
-def iou_xywh(a: Optional[Tuple[int,int,int,int]], b: Optional[Tuple[int,int,int,int]]) -> float:
-    if not a or not b: return 0.0
-    ax, ay, aw, ah = a; bx, by, bw, bh = b
-    ax2, ay2, bx2, by2 = ax+aw, ay+ah, bx+bw, by+bh
-    ix1, iy1 = max(ax, bx), max(ay, by)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    iw, ih = max(0, ix2-ix1), max(0, iy2-iy1)
-    inter = iw*ih
-    if inter <= 0: return 0.0
-    area_a, area_b = aw*ah, bw*bh
-    return inter / float(area_a + area_b - inter)
-
 def shadow(surface: pygame.Surface, text: str, pos, color, shadow_color=(0,0,0), offset=1):
     font = pygame.font.SysFont('Arial', 20)
     s = font.render(text, True, shadow_color); surface.blit(s, (pos[0]+offset, pos[1]+offset))
     s2 = font.render(text, True, color);        surface.blit(s2, pos)
 
-# Fallback labels for COCO (only used if YOLO model fails to load)
-def _fallback_labels_91():
-    L = [""]*90
-    mapping = {
-        1:"person", 2:"bicycle", 3:"car", 4:"motorcycle", 6:"bus", 7:"train", 8:"truck",
-        10:"traffic light", 13:"stop sign"
-    }
-    for k,v in mapping.items():
-        idx = k-1
-        if 0 <= idx < 90:
-            L[idx] = v
-    return L
-
 # ===================== Depth & TL helpers =====================
-def decode_depth_meters_from_bgra(depth_bgra: np.ndarray) -> np.ndarray:
-    b = depth_bgra[..., 0].astype(np.uint32)
-    g = depth_bgra[..., 1].astype(np.uint32)
-    r = depth_bgra[..., 2].astype(np.uint32)
-    normalized = (r + g * 256 + b * 256 * 256).astype(np.float32) / float(256**3 - 1)
-    return 1000.0 * normalized
-
-def intrinsics_from_fov(width: int, height: int, fov_x_deg: float):
-    fov_x = math.radians(fov_x_deg)
-    fx = (width / 2.0) / math.tan(fov_x / 2.0)
-    fy = focal_length_y_px(width, height, fov_x_deg)
-    cx, cy = width / 2.0, height / 2.0
-    return fx, fy, cx, cy
-
-def pixel_to_camera(u: float, v: float, z_m: float, fx: float, fy: float, cx: float, cy: float):
-    if z_m <= 0 or not np.isfinite(z_m):
-        return None
-    x = (u - cx) * z_m / max(1e-6, fx)
-    y = (v - cy) * z_m / max(1e-6, fy)
-    return (float(x), float(y), float(z_m))
-
 def median_depth_in_box(depth_m: np.ndarray, box, shrink: float = 0.4):
     x, y, w, h = box
     x0 = max(0, int(x + w*shrink/2.0))
@@ -957,658 +266,6 @@ def remap_zoom_box(box: Tuple[int, int, int, int], meta: Optional[Dict[str, Any]
     if y1_full + h_full > full_h:
         h_full = max(1, full_h - y1_full)
     return x1_full, y1_full, w_full, h_full
-
-# ===================== data types =====================
-from dataclasses import dataclass
-
-@dataclass
-class EgoState:
-    x: float
-    y: float
-    z: float
-    yaw_deg: float
-    v_mps: float
-    t: float
-
-# ===================== components =====================
-class YOLODetector(BaseDetector):
-    def __init__(self,
-                 conf_thr: float = CONF_THR_DEFAULT,
-                 nms_thr: float = NMS_THR,
-                 img_size: int = 640,
-                 device: str = 'auto',
-                 use_half: bool = False,
-                 agnostic: bool = False,
-                 classes: Optional[str] = None,
-                 max_det: int = 300,
-                 dnn: bool = False,
-                 augment: bool = False,
-                 per_class_iou_map: Optional[Dict[str, float]] = None):
-        """Ultralytics YOLO wrapper with runtime-configurable options.
-        - img_size: inference size (int or square side), e.g., 480 -> 480x480
-        - device: 'auto' | 'cpu' | 'cuda:0' | 'cuda'
-        - use_half: fp16 if device is CUDA and torch available
-        - agnostic: class-agnostic NMS
-        - classes: comma-separated names or ids (e.g. "person,car,traffic light" or "0,2,7"). None = all
-        - max_det: maximum detections per image
-        - dnn: use OpenCV DNN backend inside Ultralytics (rarely needed)
-        - augment: test-time augmentation
-        - per_class_iou_map: optional per-class IoU thresholds for a second-stage NMS
-        """
-        self.conf_thr = conf_thr
-        self.nms_thr = nms_thr
-        self.img_size = int(img_size)
-        self.device = device
-        self.use_half = use_half
-        self.agnostic = agnostic
-        self.classes_raw = classes  # parse later, after labels known
-        self.max_det = int(max_det)
-        self.dnn = bool(dnn)
-        self.augment = bool(augment)
-        self.per_class_iou_map = per_class_iou_map or {}
-
-        self.model = None
-        self.labels: Optional[Dict[int, str]] = None
-        self.enabled = False
-
-        # Load model
-        if _ULTRA_YOLO is not None and os.path.exists(YOLO_MODEL_PATH):
-            try:
-                self.model = _ULTRA_YOLO(YOLO_MODEL_PATH)
-                self.enabled = True
-                # Names
-                try:
-                    if hasattr(self.model, 'names'):
-                        self.labels = {int(k): v for k, v in self.model.names.items()}  # type: ignore
-                except Exception:
-                    self.labels = None
-                # Device/half
-                dev = self._resolve_device(self.device)
-                if (torch is not None) and (self.model is not None):
-                    try:
-                        self.model.to(dev)
-                        if self.use_half and 'cuda' in dev and torch.cuda.is_available():
-                            # (removed) self.model.model.half()  # let Ultralytics manage dtype via predict(half=...)  # type: ignore[attr-defined]
-                            if torch.backends and hasattr(torch.backends, 'cudnn'):
-                                torch.backends.cudnn.benchmark = True  # type: ignore
-                    except Exception:
-                        pass
-            except Exception as e:
-                print(f"[WARN] YOLO load failed: {e}")
-        if self.labels is None:
-            fb = _fallback_labels_91()
-            self.labels = {i: v for i, v in enumerate(fb)}
-
-    def _resolve_device(self, device: str) -> str:
-        if device in (None, '', 'auto'):
-            if torch is not None and hasattr(torch, 'cuda') and torch.cuda.is_available():
-                return 'cuda'
-            return 'cpu'
-        return device
-
-    def _parse_classes(self) -> Optional[List[int]]:
-        if not self.classes_raw:
-            return None
-        raw = [s.strip() for s in str(self.classes_raw).split(',') if s.strip()]
-        idxs: List[int] = []
-        for token in raw:
-            if token.isdigit():
-                idxs.append(int(token))
-            else:
-                if self.labels is None:
-                    continue
-                lower = token.lower()
-                found = [i for i, n in self.labels.items() if isinstance(n, str) and n.lower() == lower]
-                if found:
-                    idxs.append(found[0])
-        return idxs if idxs else None
-
-    @staticmethod
-    def _iou_xyxy(a, b) -> float:
-        ax1, ay1, ax2, ay2 = a
-        bx1, by1, bx2, by2 = b
-        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
-        inter = iw * ih
-        if inter <= 0:
-            return 0.0
-        area_a = (ax2 - ax1) * (ay2 - ay1)
-        area_b = (bx2 - bx1) * (by2 - by1)
-        return inter / float(area_a + area_b - inter + 1e-9)
-
-    def _apply_per_class_nms(self, classIds, confs, boxes):
-        # Convert to xyxy for IoU
-        xyxy = [(x, y, x + w, y + h) for (x, y, w, h) in boxes]
-        classIds = list(classIds); confs = list(confs)
-        keep_mask = [True] * len(xyxy)
-        # Group indices by normalized class name
-        class_to_indices: Dict[str, List[int]] = {}
-        for i, cid in enumerate(classIds):
-            name = self.labels.get(cid, str(cid)) if self.labels else str(cid)
-            class_to_indices.setdefault(_norm_label(name), []).append(i)
-        # Run greedy NMS per class with custom IoU
-        for cname, idxs in class_to_indices.items():
-            iou_thr = self.per_class_iou_map.get(cname, None)
-            if iou_thr is None:
-                continue  # use Ultralytics default already applied
-            order = sorted(idxs, key=lambda i: confs[i], reverse=True)
-            kept: List[int] = []
-            while order:
-                i = order.pop(0)
-                kept.append(i)
-                rest = []
-                for j in order:
-                    if self._iou_xyxy(xyxy[i], xyxy[j]) <= iou_thr:
-                        rest.append(j)
-                    else:
-                        keep_mask[j] = False
-                order = rest
-        # Filter outputs
-        classIds_f = [c for k, c in enumerate(classIds) if keep_mask[k]]
-        confs_f    = [s for k, s in enumerate(confs) if keep_mask[k]]
-        boxes_f    = [b for k, b in enumerate(boxes) if keep_mask[k]]
-        return classIds_f, confs_f, boxes_f
-
-    def predict_raw(self, bgr: np.ndarray):
-        if not self.enabled or self.model is None:
-            return [], [], []
-        boxes_out, confs_out, classIds_out = [], [], []
-        try:
-            dev = self._resolve_device(self.device)
-            classes_arg = self._parse_classes()
-            half_flag = (self.use_half and ('cuda' in dev)) and (getattr(torch, 'cuda', None) is None or torch.cuda.is_available())
-            try:
-                results = self.model.predict(
-                    bgr,
-                    imgsz=self.img_size,
-                    conf=self.conf_thr,
-                    iou=self.nms_thr,
-                    device=dev,
-                    half=half_flag,
-                    classes=classes_arg,
-                    agnostic_nms=self.agnostic,
-                    max_det=self.max_det,
-                    dnn=self.dnn,
-                    augment=self.augment,
-                    verbose=False)
-            except Exception as _e_pred:
-                msg = str(_e_pred)
-                if ('same dtype' in msg) or ('Half' in msg) or ('mat1 and mat2' in msg):
-                    print('[WARN] YOLO half-precision failed; retrying in FP32...')
-                    results = self.model.predict(
-                        bgr,
-                        imgsz=self.img_size,
-                        conf=self.conf_thr,
-                        iou=self.nms_thr,
-                        device=dev,
-                        half=False,
-                        classes=classes_arg,
-                        agnostic_nms=self.agnostic,
-                        max_det=self.max_det,
-                        dnn=self.dnn,
-                        augment=self.augment,
-                        verbose=False)
-                else:
-                    raise
-            for res in results:
-                xyxy = getattr(res.boxes, 'xyxy', None)
-                confs_tensor = getattr(res.boxes, 'conf', None)
-                cls_tensor   = getattr(res.boxes, 'cls', None)
-                if xyxy is None or confs_tensor is None or cls_tensor is None:
-                    continue
-                for i in range(len(xyxy)):
-                    x1, y1, x2, y2 = xyxy[i].cpu().numpy().tolist()
-                    conf_val = float(confs_tensor[i].cpu().numpy())
-                    cls_val  = int(cls_tensor[i].cpu().numpy())
-                    x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
-                    boxes_out.append((x, y, w, h))
-                    classIds_out.append(cls_val)
-                    confs_out.append(conf_val)
-        except Exception as e:
-            print(f"[WARN] YOLO inference failed: {e}")
-            return [], [], []
-        # Optional second-stage per-class NMS
-        if self.per_class_iou_map:
-            try:
-                classIds_out, confs_out, boxes_out = self._apply_per_class_nms(classIds_out, confs_out, boxes_out)
-            except Exception as _e:
-                pass
-        return classIds_out, confs_out, boxes_out
-
-class RangeEstimator:
-    def __init__(self, use_cuda: bool = False, method: str = 'bm'):
-        self.fx, self.fy, self.cx, self.cy = intrinsics_from_fov(IMG_W, IMG_H, FOV_X_DEG)
-        self.use_cuda = bool(use_cuda)
-        self.method = method.lower()
-        self.stereo = None           # CPU StereoBM
-        self.stereo_cuda = None      # CUDA StereoBM/SGM
-
-# ===================== World & Sensors
-    def ensure_stereo(self, num_disp: int = 16*6, block: int = 15):
-        """Create a stereo matcher. If --stereo-cuda is set and OpenCV CUDA is available,
-        prefer GPU; otherwise fall back to CPU StereoBM. Always returns True/False for 'ready'."""
-        # Try CUDA first if asked
-        if self.use_cuda and hasattr(cv2, 'cuda'):
-            # Try both possible factory names depending on OpenCV build
-            try:
-                if self.method == 'sgm' and hasattr(cv2.cuda, 'StereoSGM_create'):
-                    self.stereo_cuda = cv2.cuda.StereoSGM_create()  # type: ignore[attr-defined]
-                else:
-                    if hasattr(cv2.cuda, 'createStereoBM'):
-                        self.stereo_cuda = cv2.cuda.createStereoBM(numDisparities=num_disp, blockSize=block)  # type: ignore[attr-defined]
-                    elif hasattr(cv2, 'cuda_StereoBM_create'):
-                        self.stereo_cuda = cv2.cuda_StereoBM_create(numDisparities=num_disp, blockSize=block)  # type: ignore[attr-defined]
-            except Exception:
-                self.stereo_cuda = None
-        # CPU fallback
-        if self.stereo_cuda is None and self.stereo is None:
-            try:
-                self.stereo = cv2.StereoBM_create(numDisparities=num_disp, blockSize=block)
-            except Exception:
-                self.stereo = None
-        return (self.stereo_cuda is not None) or (self.stereo is not None)
-
-    def stereo_depth(self, left_bgra: np.ndarray, right_bgra: np.ndarray) -> Optional[np.ndarray]:
-        # GPU path
-        if self.stereo_cuda is not None and hasattr(cv2, 'cuda'):
-            try:
-                left_gray  = cv2.cvtColor(left_bgra,  cv2.COLOR_BGRA2GRAY)
-                right_gray = cv2.cvtColor(right_bgra, cv2.COLOR_BGRA2GRAY)
-                gL = cv2.cuda_GpuMat(); gR = cv2.cuda_GpuMat()
-                gL.upload(left_gray); gR.upload(right_gray)
-                disp_gpu = self.stereo_cuda.compute(gL, gR)  # type: ignore[attr-defined]
-                disp = disp_gpu.download().astype(np.float32) / 16.0
-                depth = np.full_like(disp, 1e6, dtype=np.float32)
-                valid = disp > 0.1
-                if np.any(valid):
-                    depth[valid] = (self.fx * STEREO_BASELINE_M) / disp[valid]
-                return depth
-            except Exception:
-                pass  # fall through to CPU if GPU fails mid-run
-        # CPU path
-        if self.stereo is None:
-            return None
-        left_gray  = cv2.cvtColor(left_bgra,  cv2.COLOR_BGRA2GRAY)
-        right_gray = cv2.cvtColor(right_bgra, cv2.COLOR_BGRA2GRAY)
-        disp = self.stereo.compute(left_gray, right_gray).astype(np.float32) / 16.0
-        depth = np.full_like(disp, 1e6, dtype=np.float32)
-        valid = disp > 0.1
-        if np.any(valid):
-            depth[valid] = (self.fx * STEREO_BASELINE_M) / disp[valid]
-        return depth
-
-# ===================== World & Sensors ====================
-class SensorRig:
-    def __init__(self, world: carla.World, vehicle: carla.Vehicle, range_est: str,
-                 enable_depth: bool = True, enable_telephoto: bool = True):
-        self.world = world
-        self.vehicle = vehicle
-        self.range_est = range_est
-        self.enable_telephoto = enable_telephoto
-        bp_lib = world.get_blueprint_library()
-
-        cam_bp = bp_lib.find('sensor.camera.rgb')
-        cam_bp.set_attribute('image_size_x', str(IMG_W))
-        cam_bp.set_attribute('image_size_y', str(IMG_H))
-        cam_bp.set_attribute('fov', str(FOV_X_DEG))
-        # Aperture and focus control
-        cam_bp.set_attribute('fstop', '8.0')       # larger => less depth-of-field blur
-        cam_bp.set_attribute('focal_distance', '1000.0')  # e.g., 1000 Unreal units (≈10 m in 0.9.7 units) – you may need adjust for 0.10
-
-        # Disable post-processing if you don’t want DOF, etc
-        # cam_bp.set_attribute('enable_postprocess_effects', 'False')
-
-        # Optional: remove lens distortion
-        cam_bp.set_attribute('lens_circle_multiplier', '0.0')
-        cam_bp.set_attribute('lens_k', '0.0')
-        # --- add motion blur config here ---
-        try:
-            # type: 0=None, 1=Gaussian, 2=Box (depending on CARLA version)
-            if cam_bp.has_attribute('motion_blur_intensity'):
-                cam_bp.set_attribute('motion_blur_intensity', '0.0')   # 0..1
-            if cam_bp.has_attribute('motion_blur_max_distortion'):
-                cam_bp.set_attribute('motion_blur_max_distortion', '0.0')
-            if cam_bp.has_attribute('motion_blur_min_object_screen_size'):
-                cam_bp.set_attribute('motion_blur_min_object_screen_size', '1.0')
-        except RuntimeError:
-            pass
-        # -----------------------------------
-
-        self.cam_front = world.spawn_actor(
-            cam_bp, carla.Transform(carla.Location(x=1.6, z=1.5)), attach_to=vehicle)
-        self.q_front: "queue.Queue[carla.Image]" = queue.Queue()
-        self.cam_front.listen(self.q_front.put)
-
-        self.cam_tele = None
-        self.q_tele = None
-        self.cam_tele_depth = None
-        self.q_tele_depth = None
-        if enable_telephoto:
-            tele_bp = bp_lib.find('sensor.camera.rgb')
-            tele_bp.set_attribute('image_size_x', str(TELEPHOTO_IMG_W))
-            tele_bp.set_attribute('image_size_y', str(TELEPHOTO_IMG_H))
-            tele_bp.set_attribute('fov', str(TELEPHOTO_FOV_X_DEG))
-            tele_bp.set_attribute('fstop', '8.0')
-            tele_bp.set_attribute('focal_distance', '1000.0')
-            tele_bp.set_attribute('lens_circle_multiplier', '0.0')
-            tele_bp.set_attribute('lens_k', '0.0')
-            try:
-                if tele_bp.has_attribute('motion_blur_intensity'):
-                    tele_bp.set_attribute('motion_blur_intensity', '0.0')
-                if tele_bp.has_attribute('motion_blur_max_distortion'):
-                    tele_bp.set_attribute('motion_blur_max_distortion', '0.0')
-                if tele_bp.has_attribute('motion_blur_min_object_screen_size'):
-                    tele_bp.set_attribute('motion_blur_min_object_screen_size', '1.0')
-            except RuntimeError:
-                pass
-            tele_tf = carla.Transform(carla.Location(x=1.6, z=1.5))
-            self.cam_tele = world.spawn_actor(tele_bp, tele_tf, attach_to=vehicle)
-            self.q_tele = queue.Queue()
-            self.cam_tele.listen(self.q_tele.put)
-
-            if enable_depth:
-                tele_depth_bp = bp_lib.find('sensor.camera.depth')
-                tele_depth_bp.set_attribute('image_size_x', str(TELEPHOTO_IMG_W))
-                tele_depth_bp.set_attribute('image_size_y', str(TELEPHOTO_IMG_H))
-                tele_depth_bp.set_attribute('fov', str(TELEPHOTO_FOV_X_DEG))
-                self.cam_tele_depth = world.spawn_actor(tele_depth_bp, tele_tf, attach_to=vehicle)
-                self.q_tele_depth = queue.Queue()
-                self.cam_tele_depth.listen(self.q_tele_depth.put)
-
-        depth_bp = bp_lib.find('sensor.camera.depth')
-        depth_bp.set_attribute('image_size_x', str(IMG_W))
-        depth_bp.set_attribute('image_size_y', str(IMG_H))
-        depth_bp.set_attribute('fov', str(FOV_X_DEG))
-        self.cam_depth = None
-        self.q_depth = None
-        if enable_depth:
-            self.cam_depth = world.spawn_actor(
-                depth_bp, carla.Transform(carla.Location(x=1.6, z=1.5)), attach_to=vehicle)
-            self.q_depth = queue.Queue()
-            self.cam_depth.listen(self.q_depth.put)
-
-        self.cam_stereo_left = None
-        self.cam_stereo_right = None
-        self.q_stereo_left = None
-        self.q_stereo_right = None
-        if range_est == 'stereo':
-            self.cam_stereo_left  = world.spawn_actor(
-                cam_bp, carla.Transform(carla.Location(x=1.6, y=-STEREO_BASELINE_M/2.0, z=1.5)), attach_to=vehicle)
-            self.cam_stereo_right = world.spawn_actor(
-                cam_bp, carla.Transform(carla.Location(x=1.6, y= STEREO_BASELINE_M/2.0, z=1.5)), attach_to=vehicle)
-            self.q_stereo_left, self.q_stereo_right = queue.Queue(), queue.Queue()
-            self.cam_stereo_left.listen(self.q_stereo_left.put)
-            self.cam_stereo_right.listen(self.q_stereo_right.put)
-
-        self.actors = [a for a in [self.cam_front, self.cam_depth,
-                                   self.cam_stereo_left, self.cam_stereo_right,
-                                   self.cam_tele, self.cam_tele_depth] if a is not None]
-
-    @staticmethod
-    def _get_latest(q: "queue.Queue[Any]", timeout: float):
-        item = q.get(timeout=timeout)
-        try:
-            while True:
-                item = q.get_nowait()
-        except queue.Empty:
-            pass
-        return item
-
-    @staticmethod
-    def _get_for_frame(q: "queue.Queue[Any]", expected_frame: int, timeout: float):
-        """Block until an item with image.frame == expected_frame arrives.
-        Discards older frames; in rare cases if a newer frame arrives first, it keeps waiting a short time.
-        Falls back to returning the most recent item if exact match does not arrive before timeout elapses repeatedly."""
-        deadline = time.time() + max(timeout, 0.5)
-        latest = None
-        while time.time() < deadline:
-            item = q.get(timeout=max(0.05, min(0.2, deadline - time.time())))
-            latest = item
-            try:
-                f = getattr(item, 'frame')
-            except Exception:
-                f = None
-            if f == expected_frame:
-                return item
-            # If older, keep draining; if newer, continue a bit in case others catch up
-            try:
-                while True:
-                    nxt = q.get_nowait()
-                    latest = nxt
-                    f = getattr(nxt, 'frame', None)
-                    if f == expected_frame:
-                        return nxt
-            except queue.Empty:
-                pass
-        return latest
-
-    def read(self, timeout: float = 2.0, expected_frame: Optional[int] = None) -> Dict[str, Any]:
-        out: Dict[str, Any] = {}
-        if expected_frame is None:
-            out['front'] = self._get_latest(self.q_front, timeout)
-            if self.q_depth is not None:
-                out['depth'] = self._get_latest(self.q_depth, timeout)
-            if self.q_stereo_left is not None and self.q_stereo_right is not None:
-                out['stereo_left']  = self._get_latest(self.q_stereo_left, timeout)
-                out['stereo_right'] = self._get_latest(self.q_stereo_right, timeout)
-            if self.q_tele is not None:
-                out['tele_rgb'] = self._get_latest(self.q_tele, timeout)
-            if self.q_tele_depth is not None:
-                out['tele_depth'] = self._get_latest(self.q_tele_depth, timeout)
-        else:
-            out['front'] = self._get_for_frame(self.q_front, expected_frame, timeout)
-            if self.q_depth is not None:
-                out['depth'] = self._get_for_frame(self.q_depth, expected_frame, timeout)
-            if self.q_stereo_left is not None and self.q_stereo_right is not None:
-                out['stereo_left']  = self._get_for_frame(self.q_stereo_left, expected_frame, timeout)
-                out['stereo_right'] = self._get_for_frame(self.q_stereo_right, expected_frame, timeout)
-            if self.q_tele is not None:
-                out['tele_rgb'] = self._get_for_frame(self.q_tele, expected_frame, timeout)
-            if self.q_tele_depth is not None:
-                out['tele_depth'] = self._get_for_frame(self.q_tele_depth, expected_frame, timeout)
-        return out
-
-    def destroy(self):
-        for a in self.actors:
-            try:
-                a.stop()
-            except Exception:
-                pass
-            # Detach listeners explicitly (older CARLA needed listen(None))
-            try:
-                a.listen(lambda *_: None)
-            except Exception:
-                pass
-            try:
-                a.destroy()
-            except Exception:
-                pass
-
-class WorldManager:
-    def __init__(self, host: str, port: int, town: Optional[str], mu: float, apply_tire_friction: bool,
-                 npc_vehicles: int = 0, npc_walkers: int = 0, npc_seed: Optional[int] = None,
-                 npc_autopilot: bool = True, npc_speed_diff_pct: int = 10):
-        self.client = carla.Client(host, port)
-        self.client.set_timeout(10.0)
-        if town:
-            # Prefer _Opt maps when available; fall back gracefully
-            load_town = town
-            try:
-                avail = []
-                try:
-                    avail = list(self.client.get_available_maps())
-                except Exception:
-                    avail = []
-                def has_map(name: str) -> bool:
-                    try:
-                        return any(m.endswith('/' + name) or m.endswith('\\' + name) or m == name for m in avail)
-                    except Exception:
-                        return False
-                if not town.endswith('_Opt'):
-                    opt = town + '_Opt'
-                    if has_map(opt):
-                        print(f"[INFO] Auto-switching to optimized map '{opt}' (was '{town}').")
-                        load_town = opt
-                else:
-                    base = town[:-4]
-                    if not has_map(town) and has_map(base):
-                        print(f"[INFO] Optimized map '{town}' not found; falling back to '{base}'.")
-                        load_town = base
-            except Exception:
-                load_town = town
-            # Ensure previous world isn't left in sync mode
-            try:
-                w0 = self.client.get_world(); s0 = w0.get_settings()
-                if s0.synchronous_mode:
-                    s0.synchronous_mode = False
-                    w0.apply_settings(s0)
-            except Exception:
-                pass
-
-            # Load the map with explicit map_layers keyword (positional 2nd arg is reset_settings)
-            try:
-                self.world = self.client.load_world(load_town, map_layers=carla.MapLayer.All)
-            except TypeError:
-                # Older API without map_layers kw: fall back to simple load
-                self.world = self.client.load_world(load_town)
-
-            # Remove baked layers if supported (CARLA ≥ 0.9.10 and *_Opt maps)
-            try:
-                if hasattr(carla, 'MapLayer'):
-                    to_remove = (carla.MapLayer.ParkedVehicles | carla.MapLayer.Props)
-                    self.world.unload_map_layer(to_remove)
-                    # Apply change on server
-                    try:
-                        self.world.tick()
-                    except Exception:
-                        pass
-                    try:
-                        map_name = self.world.get_map().name
-                        if not map_name.endswith('_Opt'):
-                            print(f"[INFO] Map '{map_name}' is not an _Opt variant; baked parked vehicles may remain. Try --town {map_name}_Opt if available.")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-            
-        else:
-            self.world = self.client.get_world()
-            try:
-                if hasattr(carla, 'MapLayer'):
-                    to_remove = (carla.MapLayer.ParkedVehicles | carla.MapLayer.Props)
-                    self.world.unload_map_layer(to_remove)
-                    try:
-                        self.world.tick()
-                    except Exception:
-                        pass
-                    try:
-                        map_name = self.world.get_map().name
-                        if not map_name.endswith('_Opt'):
-                            print(f"[INFO] Map '{map_name}' is not an _Opt variant; baked parked vehicles may remain. Consider switching to an _Opt map.")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        self.original_settings = self.world.get_settings()
-        self.tm = self.client.get_trafficmanager()
-        self.map = self.world.get_map()
-        print(f"Loaded map: {self.map.name}")
-
-        try:
-            self.world.set_weather(carla.WeatherParameters.ClearNoon)
-        except Exception:
-            pass
-
-        settings = self.world.get_settings()
-        settings.synchronous_mode = True
-        settings.fixed_delta_seconds = DT
-        self.world.apply_settings(settings)
-        self.tm.set_synchronous_mode(True)
-
-        # --- NPC management containers ---
-        self.npc_vehicles = []
-        self.npc_walkers = []
-        self.walker_controllers = []
-        self.collision_sensor = None
-        self.collision_happened = False
-
-        bp_lib = self.world.get_blueprint_library()
-        try:
-            ego_bp = bp_lib.filter('vehicle.taxi.ford')[0]
-        except Exception:
-            ego_bp = bp_lib.find('vehicle.tesla.model3')
-        spawn = carla.Transform(carla.Location(x=95.70, y=66.00, z=2.00), carla.Rotation(pitch=0.0, yaw=-180.0, roll=0.0))
-        ego = self.world.try_spawn_actor(ego_bp, spawn)
-        if ego is None:
-            ego = self.world.spawn_actor(ego_bp, random.choice(self.map.get_spawn_points()))
-        ego.set_autopilot(False)
-        self.ego = ego
-
-        # Attach a simple collision sensor to log collisions for results.
-        try:
-            col_bp = bp_lib.find('sensor.other.collision')
-            self.collision_sensor = self.world.spawn_actor(
-                col_bp,
-                carla.Transform(),
-                attach_to=self.ego,
-            )
-
-            def _on_collision(event):  # type: ignore[arg-type]
-                other_name = 'unknown'
-                impulse_mag = None
-                try:
-                    other = getattr(event, 'other_actor', None)
-                    if other is not None:
-                        other_name = getattr(other, 'type_id', str(other))
-                except Exception:
-                    pass
-                try:
-                    impulse = getattr(event, 'normal_impulse', None)
-                    if impulse is not None:
-                        impulse_mag = math.sqrt(float(impulse.x)**2 + float(impulse.y)**2 + float(impulse.z)**2)
-                except Exception:
-                    impulse_mag = None
-                self.collision_happened = True
-                self.collision_last_actor = other_name
-                self.collision_last_impulse = impulse_mag
-                self.collision_last_time = time.time()
-
-                try:
-                    if impulse_mag is not None:
-                        print(f"[COLLISION] Contact with {other_name} | impulse={impulse_mag:.1f}")
-                    else:
-                        print(f"[COLLISION] Contact with {other_name}")
-                except Exception:
-                    pass
-
-            self.collision_sensor.listen(_on_collision)
-        except Exception:
-            self.collision_sensor = None
-
-        try:
-            phys = self.ego.get_physics_control()
-            for w in phys.wheels:
-                w.max_brake_torque     = max(8000.0, getattr(w, 'max_brake_torque', 4000.0))
-                w.max_handbrake_torque = max(12000.0, getattr(w, 'max_handbrake_torque', 8000.0))
-                if apply_tire_friction:
-                    w.tire_friction = mu
-            self.ego.apply_physics_control(phys)
-        except Exception:
-            pass
-
-        # --- Optionally spawn NPCs ---
-        try:
-            if npc_seed is not None:
-                random.seed(int(npc_seed))
-            if npc_vehicles > 0:
-                self._spawn_npc_vehicles(npc_vehicles, npc_autopilot, int(max(0, min(100, npc_speed_diff_pct))))
-            if npc_walkers > 0:
-                self._spawn_npc_walkers(npc_walkers)
-        except Exception as _e:
-            pass
 
     def tick(self):
         return self.world.tick()
@@ -1769,148 +426,6 @@ class WorldManager:
                 pass
 
 # ========================= App ===========================
-class _TelemetryLogger:
-    def __init__(self, path: str, hz: float = 10.0):
-        import csv
-        self.path = path
-        self.hz = max(0.1, float(hz))
-        self.period = 1.0 / self.hz
-        self._last_t = -1e9
-        self._csv_f = open(self.path, 'w', newline='')
-        self._w = csv.writer(self._csv_f)
-        self._w.writerow([
-            't','v_mps','tau_dyn','D_safety_dyn','sigma_depth','a_des','brake',
-            'lambda_max','abs_factor','mu_est','mu_regime',
-            'loop_ms','loop_ms_max','detect_ms','latency_ms','a_meas','x_rel_m','range_est_m',
-            'ttc_s','gate_hit','gate_confirmed','false_stop_flag','brake_stage','brake_stage_factor',
-            'tracker_s_m','tracker_rate_mps','lead_track_id','active_track_count',
-            'sensor_ts','control_ts','sensor_to_control_ms',
-            'actuation_ts','control_to_act_ms','sensor_to_act_ms'
-        ])
-
-    def maybe_log(self, t: float, v: float, tau_dyn: Optional[float], D_safety_dyn: Optional[float],
-                  sigma_depth: Optional[float], a_des: Optional[float], brake: Optional[float],
-                  lambda_max: Optional[float], abs_factor: Optional[float],
-                  mu_est: Optional[float], mu_regime: Optional[str],
-                  loop_ms: Optional[float], loop_ms_max: Optional[float],
-                  detect_ms: Optional[float], latency_ms: Optional[float],
-                  a_meas: Optional[float], x_rel_m: Optional[float], range_est_m: Optional[float],
-                  ttc_s: Optional[float],
-                  gate_hit: Optional[bool], gate_confirmed: Optional[bool],
-                  false_stop_flag: Optional[bool],
-                  brake_stage: Optional[int], brake_stage_factor: Optional[float],
-                  tracker_s: Optional[float], tracker_rate: Optional[float],
-                  tracker_id: Optional[int], tracker_count: Optional[int],
-                  sensor_ts: Optional[float], control_ts: Optional[float],
-                  sensor_to_control_ms: Optional[float],
-                  actuation_ts: Optional[float],
-                  control_to_act_ms: Optional[float],
-                  sensor_to_act_ms: Optional[float]):
-        if t - self._last_t >= self.period:
-            self._last_t = t
-            self._w.writerow([
-                float(t), float(v),
-                (None if tau_dyn is None else float(tau_dyn)),
-                (None if D_safety_dyn is None else float(D_safety_dyn)),
-                (None if sigma_depth is None else float(sigma_depth)),
-                (None if a_des is None else float(a_des)),
-                (None if brake is None else float(brake)),
-                (None if lambda_max is None else float(lambda_max)),
-                (None if abs_factor is None else float(abs_factor)),
-                (None if mu_est is None else float(mu_est)),
-                mu_regime,
-                (None if loop_ms is None else float(loop_ms)),
-                (None if loop_ms_max is None else float(loop_ms_max)),
-                (None if detect_ms is None else float(detect_ms)),
-                (None if latency_ms is None else float(latency_ms)),
-                (None if a_meas is None else float(a_meas)),
-                (None if x_rel_m is None else float(x_rel_m)),
-                (None if range_est_m is None else float(range_est_m)),
-                (None if ttc_s is None else float(ttc_s)),
-                (None if gate_hit is None else int(bool(gate_hit))),
-                (None if gate_confirmed is None else int(bool(gate_confirmed))),
-                (None if false_stop_flag is None else int(bool(false_stop_flag))),
-                (None if brake_stage is None else int(brake_stage)),
-                (None if brake_stage_factor is None else float(brake_stage_factor)),
-                (None if tracker_s is None else float(tracker_s)),
-                (None if tracker_rate is None else float(tracker_rate)),
-                (None if tracker_id is None else int(tracker_id)),
-                (None if tracker_count is None else int(tracker_count)),
-                (None if sensor_ts is None else float(sensor_ts)),
-                (None if control_ts is None else float(control_ts)),
-                (None if sensor_to_control_ms is None else float(sensor_to_control_ms)),
-                (None if actuation_ts is None else float(actuation_ts)),
-                (None if control_to_act_ms is None else float(control_to_act_ms)),
-                (None if sensor_to_act_ms is None else float(sensor_to_act_ms)),
-            ])
-
-    def close(self):
-        try:
-            self._csv_f.close()
-        except Exception:
-            pass
-class _ScenarioLogger:
-    """High-level braking/scenario outcomes for thesis-style results.
-
-    Each row captures one braking episode: initial speed/distance, minimum
-    distance, whether the ego stopped, and time-to-stop.
-    """
-
-    def __init__(self, path: str):
-        import csv
-        folder = os.path.dirname(os.path.abspath(path))
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        self._f = open(path, 'w', newline='')
-        self._w = csv.writer(self._f)
-        self._w.writerow([
-            'scenario', 'trigger_kind', 'mu',
-            'v_init_mps', 's_init_m', 's_min_m',
-            's_init_gt_m', 's_min_gt_m',
-            'stopped', 't_to_stop_s', 'collision',
-            'range_margin_m', 'tts_margin_s',
-            'ttc_init_s', 'ttc_min_s', 'reaction_time_s',
-            'max_lambda', 'mean_abs_factor', 'false_stop'
-        ])
-        self._f.flush()
-
-    def log(self, scenario: str, trigger_kind: str, mu: float,
-            v_init: float, s_init: float, s_min: float,
-            s_init_gt: Optional[float], s_min_gt: Optional[float],
-            stopped: bool, t_to_stop: float, collision: bool,
-            range_margin: Optional[float], tts_margin: Optional[float],
-            ttc_init: Optional[float], ttc_min: Optional[float],
-            reaction_time: Optional[float],
-            max_lambda: Optional[float], mean_abs_factor: Optional[float],
-            false_stop: bool):
-        self._w.writerow([
-            scenario,
-            trigger_kind,
-            float(mu),
-            float(v_init),
-            float(s_init),
-            float(s_min),
-            (None if s_init_gt is None else float(s_init_gt)),
-            (None if s_min_gt is None else float(s_min_gt)),
-            bool(stopped),
-            float(t_to_stop),
-            bool(collision),
-            (None if range_margin is None else float(range_margin)),
-            (None if tts_margin is None else float(tts_margin)),
-            (None if ttc_init is None else float(ttc_init)),
-            (None if ttc_min is None else float(ttc_min)),
-            (None if reaction_time is None else float(reaction_time)),
-            (None if max_lambda is None else float(max_lambda)),
-            (None if mean_abs_factor is None else float(mean_abs_factor)),
-            bool(false_stop),
-        ])
-        self._f.flush()
-
-    def close(self):
-        try:
-            self._f.close()
-        except Exception:
-            pass
 class App:
     def __init__(self, args):
         self.args = args
@@ -1997,6 +512,74 @@ class App:
             self.abs_actuator = PISlipABSActuator(dt=DT)
         else:
             self.abs_actuator = AdaptivePISlipABSActuator(dt=DT)
+        # ECU adapters make the perception/control/actuation responsibilities explicit.
+        self.multiprocess_ecus = bool(getattr(self.args, 'multiprocess_ecus', False))
+        self.ecu_process_timeout = max(0.05, float(getattr(self.args, 'ecu_process_timeout', 0.35)))
+        self.bus_manager = mp.Manager() if self.multiprocess_ecus else None
+        self.bus = MessageBus(self.bus_manager)
+        self.bus_latency_perception = max(0.0, float(getattr(self.args, 'bus_latency_perception', 0.0)))
+        self.bus_latency_planning = max(0.0, float(getattr(self.args, 'bus_latency_planning', 0.0)))
+        bus_defaults = {
+            'perception': {
+                'drop_rate': max(0.0, min(1.0, float(getattr(self.args, 'bus_drop_perception', 0.0)))),
+                'jitter_s': max(0.0, float(getattr(self.args, 'bus_jitter_perception', 0.0))),
+                'max_age_s': 0.35,
+                'max_depth': 8,
+                'deadline_s': max(0.05, float(getattr(self.args, 'bus_deadline_perception', 0.15))),
+                'priority': 1,
+            },
+            'planning': {
+                'drop_rate': max(0.0, min(1.0, float(getattr(self.args, 'bus_drop_planning', 0.0)))),
+                'jitter_s': max(0.0, float(getattr(self.args, 'bus_jitter_planning', 0.0))),
+                'max_age_s': 0.35,
+                'max_depth': 8,
+                'deadline_s': max(0.05, float(getattr(self.args, 'bus_deadline_planning', 0.15))),
+                'priority': 0,
+            },
+        }
+        self.bus_calibration = load_bus_calibration(getattr(self.args, 'bus_calibration_file', None), bus_defaults)
+        for topic, cfg in self.bus_calibration.items():
+            self.bus.configure_topic(
+                topic,
+                drop_rate=cfg.drop_rate,
+                jitter_s=cfg.jitter_s,
+                max_age_s=cfg.max_age_s,
+                max_depth=cfg.max_depth,
+                deadline_s=cfg.deadline_s,
+                priority=cfg.priority,
+            )
+        self.perception_ecu = PerceptionECU(self._perception_step)
+        self.planning_ecu = PlanningECU(self._control_step)
+        self.actuation_ecu = ActuationECU(
+            abs_fn=(None if self.abs_actuator is None else self.abs_actuator.step),
+            abs_debug_fn=(None if self.abs_actuator is None else self.abs_actuator.debug_metrics),
+        )
+        self.ecu_pipeline = None
+        if self.multiprocess_ecus:
+            self.ecu_pipeline = DistributedECUPipeline(
+                partial(_perception_job_handler, self.perception_ecu),
+                partial(_planning_job_handler, self.planning_ecu),
+                partial(_actuation_job_handler, self.actuation_ecu),
+            )
+        safety_defaults = {
+            'perception_freshness_s': float(getattr(self.args, 'perception_freshness_s', 0.35)),
+            'planning_freshness_s': float(getattr(self.args, 'planning_freshness_s', 0.35)),
+            'actuation_freshness_s': float(getattr(self.args, 'actuation_freshness_s', 0.35)),
+            'ttc_floor_s': float(getattr(self.args, 'safety_ttc_floor_s', 0.25)),
+            'v_min_plausible': float(getattr(self.args, 'safety_v_min_plausible', 0.5)),
+            'wheel_slip_max': float(getattr(self.args, 'safety_wheel_slip_max', 0.45)),
+            'brake_fail_safe': float(getattr(self.args, 'brake_fail_safe', 1.0)),
+        }
+        self.safety_calibration = load_safety_calibration(getattr(self.args, 'safety_calibration_file', None), safety_defaults)
+        self.safety_manager = SafetyManager(
+            brake_fail_safe=self.safety_calibration.brake_fail_safe,
+            perception_freshness_s=self.safety_calibration.perception_freshness_s,
+            planning_freshness_s=self.safety_calibration.planning_freshness_s,
+            actuation_freshness_s=self.safety_calibration.actuation_freshness_s,
+            ttc_floor_s=self.safety_calibration.ttc_floor_s,
+            v_min_plausible=self.safety_calibration.v_min_plausible,
+            wheel_slip_max=self.safety_calibration.wheel_slip_max,
+        )
         self._lead_tracker = LeadMultiObjectTracker(dt=DT)
         # Telemetry set up
         self.telemetry: Optional[_TelemetryLogger] = None
@@ -2033,51 +616,29 @@ class App:
         except Exception:
             self.stereo_roi_shrink = STEREO_ROI_SHRINK_DEFAULT
 
-        # Decision-layer tuning knobs
-        try:
-            self.min_aeb_speed = max(0.0, float(getattr(self.args, 'min_aeb_speed', V_AEB_MIN_DEFAULT)))
-        except Exception:
-            self.min_aeb_speed = V_AEB_MIN_DEFAULT
-        try:
-            self.gate_confirm_frames = max(1, int(getattr(self.args, 'gate_confirm_frames', GATE_CONFIRM_FRAMES_DEFAULT)))
-        except Exception:
-            self.gate_confirm_frames = GATE_CONFIRM_FRAMES_DEFAULT
-        try:
-            self.ttc_confirm_s = max(0.5, float(getattr(self.args, 'ttc_confirm_s', TTC_CONFIRM_S_DEFAULT)))
-        except Exception:
-            self.ttc_confirm_s = TTC_CONFIRM_S_DEFAULT
-        try:
-            self.ttc_stage_strong = max(0.1, float(getattr(self.args, 'ttc_stage_strong', TTC_STAGE_STRONG_DEFAULT)))
-        except Exception:
-            self.ttc_stage_strong = TTC_STAGE_STRONG_DEFAULT
-        try:
-            self.ttc_stage_full = max(0.05, float(getattr(self.args, 'ttc_stage_full', TTC_STAGE_FULL_DEFAULT)))
-        except Exception:
-            self.ttc_stage_full = TTC_STAGE_FULL_DEFAULT
-        # Ensure ordering: full < strong <= confirm
-        if self.ttc_stage_strong <= self.ttc_stage_full:
-            self.ttc_stage_strong = self.ttc_stage_full + 0.05
-        self.ttc_stage_strong = min(self.ttc_confirm_s, self.ttc_stage_strong)
-        if self.ttc_stage_full >= self.ttc_stage_strong:
-            self.ttc_stage_full = max(0.1, self.ttc_stage_strong - 0.05)
-        try:
-            self.stage_factor_comfort = max(0.1, min(0.95, float(getattr(self.args, 'aeb_stage_comfort', BRAKE_STAGE_COMFORT_FACTOR))))
-        except Exception:
-            self.stage_factor_comfort = BRAKE_STAGE_COMFORT_FACTOR
-        try:
-            self.stage_factor_strong = max(self.stage_factor_comfort + 0.01,
-                                           min(0.99, float(getattr(self.args, 'aeb_stage_strong', BRAKE_STAGE_STRONG_FACTOR))))
-        except Exception:
-            self.stage_factor_strong = BRAKE_STAGE_STRONG_FACTOR
+        # Decision-layer tuning knobs, validated via calibration payloads
+        cal_defaults = {
+            'min_aeb_speed': getattr(self.args, 'min_aeb_speed', V_AEB_MIN_DEFAULT),
+            'gate_confirm_frames': getattr(self.args, 'gate_confirm_frames', GATE_CONFIRM_FRAMES_DEFAULT),
+            'ttc_confirm_s': getattr(self.args, 'ttc_confirm_s', TTC_CONFIRM_S_DEFAULT),
+            'ttc_stage_strong': getattr(self.args, 'ttc_stage_strong', TTC_STAGE_STRONG_DEFAULT),
+            'ttc_stage_full': getattr(self.args, 'ttc_stage_full', TTC_STAGE_FULL_DEFAULT),
+            'stage_factor_comfort': getattr(self.args, 'aeb_stage_comfort', BRAKE_STAGE_COMFORT_FACTOR),
+            'stage_factor_strong': getattr(self.args, 'aeb_stage_strong', BRAKE_STAGE_STRONG_FACTOR),
+            'aeb_ramp_up': getattr(self.args, 'aeb_ramp_up', AEB_RAMP_UP_DEFAULT),
+            'aeb_ramp_down': getattr(self.args, 'aeb_ramp_down', AEB_RAMP_DOWN_DEFAULT),
+        }
+        self.calibration = load_aeb_calibration(getattr(self.args, 'calibration_file', None), cal_defaults)
+        self.min_aeb_speed = self.calibration.min_aeb_speed
+        self.gate_confirm_frames = self.calibration.gate_confirm_frames
+        self.ttc_confirm_s = self.calibration.ttc_confirm_s
+        self.ttc_stage_strong = self.calibration.ttc_stage_strong
+        self.ttc_stage_full = self.calibration.ttc_stage_full
+        self.stage_factor_comfort = self.calibration.stage_factor_comfort
+        self.stage_factor_strong = self.calibration.stage_factor_strong
         self.stage_factor_full = BRAKE_STAGE_FULL_FACTOR
-        try:
-            self.aeb_ramp_up = max(0.5, float(getattr(self.args, 'aeb_ramp_up', AEB_RAMP_UP_DEFAULT)))
-        except Exception:
-            self.aeb_ramp_up = AEB_RAMP_UP_DEFAULT
-        try:
-            self.aeb_ramp_down = max(0.5, float(getattr(self.args, 'aeb_ramp_down', AEB_RAMP_DOWN_DEFAULT)))
-        except Exception:
-            self.aeb_ramp_down = AEB_RAMP_DOWN_DEFAULT
+        self.aeb_ramp_up = self.calibration.aeb_ramp_up
+        self.aeb_ramp_down = self.calibration.aeb_ramp_down
 
         self._gate_confirm_counter = 0
         self._hazard_confirm_since = -1.0
@@ -3171,10 +1732,67 @@ class App:
                 detect_ms = None
                 detect_t0 = time.time()
                 self._frame_index += 1
-                perc = self._perception_step(bgr, depth_m, depth_stereo_m, FX_, FY_, CX_, CY_,
-                                             sim_time, sensor_timestamp, v, MU, log_both, csv_w,
-                                             tele_bgr=tele_bgr, tele_depth_m=tele_depth_m)
+                if self.ecu_pipeline is not None:
+                    perc_job = PerceptionJob(
+                        bgr=bgr,
+                        depth_m=depth_m,
+                        depth_stereo_m=depth_stereo_m,
+                        fx=FX_,
+                        fy=FY_,
+                        cx=CX_,
+                        cy=CY_,
+                        sim_time=sim_time,
+                        sensor_timestamp=sensor_timestamp,
+                        v=v,
+                        mu=MU,
+                        log_both=log_both,
+                        csv_writer=csv_w,
+                        tele_bgr=tele_bgr,
+                        tele_depth_m=tele_depth_m,
+                    )
+                    try:
+                        perc = self.ecu_pipeline.run_perception(perc_job, timeout=self.ecu_process_timeout)
+                    except Exception as exc:
+                        perc = PerceptionSignal(
+                            bgr=bgr,
+                            det_points=[],
+                            nearest_s_active=None,
+                            nearest_kind=None,
+                            nearest_thr=None,
+                            nearest_box=None,
+                            nearest_conf=None,
+                            tl_state='UNKNOWN',
+                            tl_s_active=None,
+                            tl_det_box=None,
+                            stop_detected_current=False,
+                            fault_code=f'PERCEPTION_PROC_FAIL:{exc}',
+                            valid=False,
+                        )
+                        perc.timestamp = time.time()
+                else:
+                    perc = self.perception_ecu.process(
+                        bgr,
+                        depth_m,
+                        depth_stereo_m,
+                        FX_,
+                        FY_,
+                        CX_,
+                        CY_,
+                        sim_time,
+                        sensor_timestamp,
+                        v,
+                        MU,
+                        log_both,
+                        csv_w,
+                        tele_bgr=tele_bgr,
+                        tele_depth_m=tele_depth_m,
+                    )
                 detect_ms = (time.time() - detect_t0) * 1000.0
+                perc.frame_id = self._frame_index
+                perc.validate(freshness_s=self.safety_calibration.perception_freshness_s)
+                self.bus.send('perception', perc, now=sim_time, latency_s=self.bus_latency_perception)
+                perc_bus = self.bus.receive_latest('perception', now=sim_time, max_age_s=0.3)
+                perc = perc_bus or perc
                 bgr = perc['bgr']
                 det_points = perc['det_points']
                 nearest_s_active = perc['nearest_s_active']
@@ -3253,30 +1871,151 @@ class App:
 
                 trigger_name = nearest_kind
 
-                # Control step via helper
-                throttle, brake, ctrl, hold_blocked, hold_reason, stop_armed, stop_latch_time, stop_release_ignore_until, dbg_map, I_err = \
-                    self._control_step(trigger_name, nearest_s_active, nearest_thr,
-                                       tl_state, tl_s_active, v, v_target, MU, ema_loop_ms,
-                                       tracked_distance_for_control, stop_armed, stop_latch_time, stop_release_ignore_until,
-                                       red_green_since, no_trigger_elapsed, no_red_elapsed,
-                                       depth_m, depth_stereo_m, nearest_box, nearest_conf,
-                                       I_err, v_prev)
+                # Control step via helper (conceptually ADAS domain ECU → Brake ECU request)
+                if self.ecu_pipeline is not None:
+                    plan_job = PlanningJob(
+                        trigger_name=trigger_name,
+                        nearest_s_active=nearest_s_active,
+                        nearest_thr=nearest_thr,
+                        tl_state=tl_state,
+                        tl_s_active=tl_s_active,
+                        v=v,
+                        v_target=v_target,
+                        mu=MU,
+                        ema_loop_ms=ema_loop_ms,
+                        tracked_distance_for_control=tracked_distance_for_control,
+                        stop_armed=stop_armed,
+                        stop_latch_time=stop_latch_time,
+                        stop_release_ignore_until=stop_release_ignore_until,
+                        red_green_since=red_green_since,
+                        no_trigger_elapsed=no_trigger_elapsed,
+                        no_red_elapsed=no_red_elapsed,
+                        depth_m=depth_m,
+                        depth_stereo_m=depth_stereo_m,
+                        nearest_box=nearest_box,
+                        nearest_conf=nearest_conf,
+                        I_err=I_err,
+                        v_prev=v_prev,
+                    )
+                    try:
+                        planning_decision = self.ecu_pipeline.run_planning(plan_job, timeout=self.ecu_process_timeout)
+                    except Exception as exc:
+                        planning_decision = PlanningDecision(
+                            throttle=0.0,
+                            brake=1.0,
+                            ctrl=None,
+                            hold_blocked=True,
+                            hold_reason=f'PLANNING_PROC_FAIL:{exc}',
+                            stop_armed=stop_armed,
+                            stop_latch_time=stop_latch_time,
+                            stop_release_ignore_until=stop_release_ignore_until,
+                            debug={},
+                            integral_error=I_err,
+                            aeb_request=None,
+                            valid=False,
+                            fault_code=f'PLANNING_PROC_FAIL:{exc}',
+                        )
+                        planning_decision.timestamp = time.time()
+                else:
+                    planning_decision = self.planning_ecu.plan(
+                        trigger_name,
+                        nearest_s_active,
+                        nearest_thr,
+                        tl_state,
+                        tl_s_active,
+                        v,
+                        v_target,
+                        MU,
+                        ema_loop_ms,
+                        tracked_distance_for_control,
+                        stop_armed,
+                        stop_latch_time,
+                        stop_release_ignore_until,
+                        red_green_since,
+                        no_trigger_elapsed,
+                        no_red_elapsed,
+                        depth_m,
+                        depth_stereo_m,
+                        nearest_box,
+                        nearest_conf,
+                        I_err,
+                        v_prev,
+                    )
+                planning_decision.validate(freshness_s=self.safety_calibration.planning_freshness_s)
+                self.bus.send('planning', planning_decision, now=sim_time, latency_s=self.bus_latency_planning)
+                planning_from_bus = self.bus.receive_latest('planning', now=sim_time, max_age_s=0.3)
+                if planning_from_bus is not None:
+                    planning_decision = planning_from_bus
+                if not planning_decision.valid:
+                    planning_decision.brake = max(planning_decision.brake, 1.0)
+                    planning_decision.throttle = 0.0
+                throttle = planning_decision.throttle
+                brake = planning_decision.brake
+                ctrl = planning_decision.ctrl
+                hold_blocked = planning_decision.hold_blocked
+                hold_reason = planning_decision.hold_reason
+                stop_armed = planning_decision.stop_armed
+                stop_latch_time = planning_decision.stop_latch_time
+                stop_release_ignore_until = planning_decision.stop_release_ignore_until
+                dbg_map = planning_decision.debug
+                I_err = planning_decision.integral_error
+                perception_latency_ms = (time.time() - perc.timestamp) * 1000.0 if hasattr(perc, 'timestamp') else None
+                planning_latency_ms = (time.time() - planning_decision.timestamp) * 1000.0
+                dbg_map = dict(dbg_map or {})
+                dbg_map['perception_bus_latency_ms'] = perception_latency_ms
+                dbg_map['planning_bus_latency_ms'] = planning_latency_ms
+                dbg_map['planning_valid'] = planning_decision.valid
+                dbg_map['bus_metrics'] = {
+                    'perception': dict(self.bus.metrics.get('perception', {})),
+                    'planning': dict(self.bus.metrics.get('planning', {})),
+                }
+                dbg_map['ecu_process_mode'] = 'distributed' if self.ecu_pipeline is not None else 'in_process'
+                dbg_map['calibration_meta'] = {
+                    'aeb': getattr(self.calibration, 'metadata', {}),
+                    'safety': getattr(self.safety_calibration, 'metadata', {}),
+                    'bus': {k: vars(v) for k, v in self.bus_calibration.items()},
+                }
+                if planning_decision.aeb_request is not None:
+                    dbg_map['aeb_request'] = {
+                        'mode': planning_decision.aeb_request.mode,
+                        'target_decel': planning_decision.aeb_request.target_decel,
+                        'priority': planning_decision.aeb_request.priority,
+                    }
                 abs_lambda = None
                 abs_factor = None
                 abs_mu = None
                 abs_regime = 'off' if self.abs_actuator is None else None
                 abs_dbg = None
-                if self.abs_actuator is not None:
+                if self.ecu_pipeline is not None:
+                    abs_job = ActuationJob(brake_cmd=brake, v_ego=v, wheel_speeds=wheel_speeds, a_long=a_long)
                     try:
-                        brake = self.abs_actuator.step(brake, v, wheel_speeds, a_long)
-                        abs_dbg = self.abs_actuator.debug_metrics()
-                    except Exception:
-                        abs_dbg = None
-                    if abs_dbg is not None:
-                        abs_lambda = abs_dbg.get('lambda_max')
-                        abs_factor = abs_dbg.get('f_global')
-                        abs_mu = abs_dbg.get('mu_est')
-                        abs_regime = abs_dbg.get('regime')
+                        abs_result = self.ecu_pipeline.run_actuation(abs_job, timeout=self.ecu_process_timeout)
+                    except Exception as exc:
+                        abs_result = ActuationResult(brake=brake, abs_dbg=None, fault_code=f'ACT_PROC_FAIL:{exc}', valid=False)
+                        abs_result.timestamp = time.time()
+                else:
+                    abs_result = self.actuation_ecu.apply_abs(brake, v, wheel_speeds, a_long)
+                abs_result.validate(freshness_s=self.safety_calibration.actuation_freshness_s)
+                brake = abs_result.get('brake', brake)
+                abs_dbg = abs_result.get('abs_dbg')
+                planning_decision.brake = brake
+                if not abs_result.valid:
+                    brake = max(brake, 1.0)
+                    dbg_map['abs_fault'] = abs_result.fault_code or 'UNKNOWN_ABS_FAULT'
+                safety = self.safety_manager.evaluate(perc, planning_decision, abs_result, v_ego=v, ttc=dbg_map.get('ttc'))
+                if safety.mode != 'NOMINAL':
+                    throttle = safety.throttle
+                    brake = max(brake, safety.brake)
+                dbg_map['safety_mode'] = safety.mode
+                if safety.faults:
+                    dbg_map['safety_faults'] = list(safety.faults)
+                if safety.latched:
+                    dbg_map['safety_faults_latched'] = list(safety.latched)
+                if abs_dbg is not None:
+                    abs_lambda = abs_dbg.get('lambda_max')
+                    abs_factor = abs_dbg.get('f_global')
+                    abs_mu = abs_dbg.get('mu_est')
+                    abs_regime = abs_dbg.get('regime')
 
                 # If a new brake command crosses the threshold, start measuring actuation latency
                 brake_cmd_for_latency = float(brake)
@@ -3702,178 +2441,7 @@ class App:
             except Exception:
                 pass
 
-# ========================= entry =========================
-def parse_args():
-    parser = argparse.ArgumentParser(description='Nearestfirst + TL/StopSign (YOLO + depth + stereo) — OOP wired (+TL, ABS, timers, stop-release fix, YOLO opts, CUDA stereo, per-class conf, presets)')
-    parser.add_argument('--host', default='127.0.0.1')
-    parser.add_argument('--port', type=int, default=2000)
-    parser.add_argument('--town', type=str, default='Town10HD_Opt', help='Town name, e.g., Town03 or Town05_Opt')
-    parser.add_argument('--mu', type=float, default=MU_DEFAULT, help='Road friction estimate (dry~0.9, wet~0.6, ice~0.2)')
-    parser.add_argument('--abs-mode', type=str, default='adaptive', choices=['off','fixed','adaptive'],
-                        help='Slip controller: off (direct brake), fixed PI ABS, or μ-adaptive PI ABS')
-    parser.add_argument('--apply-tire-friction', action='store_true',
-                        help='Also set wheel.tire_friction≈mu to make the sim physically slick.')
-    parser.add_argument('--persist-frames', type=int, default=2,
-                        help='Consecutive frames required to confirm a stop‑sign before arming the stop latch')
-    parser.add_argument('--min-aeb-speed', type=float, default=V_AEB_MIN_DEFAULT,
-                        help='Minimum ego speed (m/s) before obstacle-triggered AEB can engage')
-    parser.add_argument('--gate-confirm-frames', type=int, default=GATE_CONFIRM_FRAMES_DEFAULT,
-                        help='Consecutive gate-hit frames required before obstacle braking is allowed')
-    parser.add_argument('--ttc-confirm-s', type=float, default=TTC_CONFIRM_S_DEFAULT,
-                        help='TTC threshold (seconds) that must be met before obstacle braking is allowed')
-    parser.add_argument('--ttc-stage-strong', type=float, default=TTC_STAGE_STRONG_DEFAULT,
-                        help='TTC threshold (seconds) to escalate from comfort to strong braking once confirmed')
-    parser.add_argument('--ttc-stage-full', type=float, default=TTC_STAGE_FULL_DEFAULT,
-                        help='TTC threshold (seconds) to escalate from strong to full AEB braking')
-    parser.add_argument('--aeb-stage-comfort', type=float, default=BRAKE_STAGE_COMFORT_FACTOR,
-                        help='Fraction of μg to request during the comfort braking stage (0..1)')
-    parser.add_argument('--aeb-stage-strong', type=float, default=BRAKE_STAGE_STRONG_FACTOR,
-                        help='Fraction of μg to request during the strong braking stage (0..1)')
-    parser.add_argument('--aeb-ramp-up', type=float, default=AEB_RAMP_UP_DEFAULT,
-                        help='Max increase rate for a_des (m/s^2 per second) when escalating braking')
-    parser.add_argument('--aeb-ramp-down', type=float, default=AEB_RAMP_DOWN_DEFAULT,
-                        help='Max decrease rate for a_des (m/s^2 per second) when relaxing braking')
-    parser.add_argument('--range-est', type=str, default='pinhole',
-                        choices=['pinhole', 'depth', 'stereo', 'both'],
-                        help='Distance source: monocular pinhole, CARLA depth, stereo vision, or log both (depth vs pinhole)')
-    parser.add_argument('--compare-csv', type=str, default=None,
-                        help='If set (range-est both/stereo), write pinhole/depth/stereo comparisons to this CSV path')
-    parser.add_argument('--stereo-compare-csv', type=str, default=None,
-                        help='If set and --range-est=stereo, write stereo vs depth comparisons to this CSV path')
-    parser.add_argument('--depth-roi-shrink', type=float, default=DEPTH_ROI_SHRINK_DEFAULT,
-                        help='ROI shrink factor (0..0.9) when sampling CARLA depth inside detection boxes')
-    parser.add_argument('--stereo-roi-shrink', type=float, default=STEREO_ROI_SHRINK_DEFAULT,
-                        help='ROI shrink factor (0..0.9) when sampling stereo disparity depth')
-    # Visualization toggles
-    parser.add_argument('--no-depth-viz', action='store_true',
-                        help='(Deprecated) Legacy alias for --no-opencv; OpenCV windows are no longer used')
-    parser.add_argument('--no-opencv', action='store_true',
-                        help='(Deprecated) No effect now that depth/HUD HUD_DIST windows render inside pygame')
-    parser.add_argument('--no-top-cam', action='store_true',
-                        help='Disable spawning the top view camera and hide it from the HUD')
-    parser.add_argument('--no-depth-cam', action='store_true',
-                        help='Disable spawning the depth camera (range_est depth will be auto-fallback)')
-    parser.add_argument('--no-telephoto', action='store_true',
-                        help='Disable the telephoto traffic-light helper camera and detector scheduling')
-    parser.add_argument('--telephoto-stride', type=int, default=TELEPHOTO_STRIDE_DEFAULT,
-                        help='Run telephoto YOLO inference every N frames (>=2). Default=3')
-    parser.add_argument('--telephoto-zoom', type=float, default=TELEPHOTO_DIGITAL_ZOOM_DEFAULT,
-                        help='Digital zoom factor (>=1.0) for the telephoto feed (crop upper-center, resize, reuse boxes).'
-                             ' Default=1.5; set to 1.0 to disable')
-    parser.add_argument('--telephoto-compute-log', type=str, default=None,
-                        help='Optional CSV path to log total compute time with/without telephoto assists (plus cache/skip stats)')
-    parser.add_argument('--headless', action='store_true',
-                        help='Run without GUI windows (also disables OpenCV windows)')
-
-    parser.add_argument('--video-out', type=str, default=None,
-                        help='Optional path to write an MP4 video of the front RGB view (qualitative results)')
-
-    # YOLO options
-    parser.add_argument('--yolo-img', type=int, default=640,
-                        help='YOLO inference size (square). Example: 480 -> 480x480')
-    parser.add_argument('--yolo-device', type=str, default='cuda',
-                        help="Inference device: 'auto'|'cpu'|'cuda'|'cuda:0'")
-    parser.add_argument('--yolo-half', action='store_true', help='Use FP16 if CUDA is available')
-    parser.add_argument('--yolo-agnostic', action='store_true', help='Class-agnostic NMS')
-    parser.add_argument('--yolo-classes', type=str, default=None,
-                        help='Comma-separated class names or indices (e.g., "person,car,traffic light" or "0,2,7"). None=all')
-    parser.add_argument('--yolo-class-thr', type=str, default=None,
-                        help='Per-class confidence thresholds: "traffic light:0.55, stop sign:0.45"')
-    parser.add_argument('--yolo-class-iou', type=str, default=None,
-                        help='Per-class NMS IoU thresholds: "traffic light:0.40, person:0.55"')
-    parser.add_argument('--yolo-max-det', type=int, default=200, help='Max detections per image')
-    parser.add_argument('--yolo-dnn', action='store_true', help='Use OpenCV DNN backend (if supported)')
-    parser.add_argument('--yolo-augment', action='store_true', help='Enable TTA/augment for detection')
-
-    # Stereo CUDA options
-    parser.add_argument('--stereo-cuda', action='store_true', help='Use OpenCV CUDA StereoBM/SGM if available')
-    parser.add_argument('--stereo-method', type=str, default='bm', choices=['bm','sgm'], help='Stereo method for CUDA path')
-
-    # Per-class detection & gating overrides
-    parser.add_argument('--min-h-override', type=str, default=None,
-                        help='Per-class min box height (px): "person:18, traffic light:14"')
-    parser.add_argument('--gate-frac-override', type=str, default=None,
-                        help='Per-class center-band fraction (0..1): "car:0.35, person:0.45"')
-    parser.add_argument('--gate-lateral-override', type=str, default=None,
-                        help='Per-class lateral max in meters: "car:2.2, person:3.0"')
-
-    # Engage threshold overrides
-    parser.add_argument('--engage-override', type=str, default=None,
-                        help='Per-class engage distances (m): "person:45, traffic light:55, car:80, stopsign:80"')
-    parser.add_argument('--tl-unknown-conservative', action='store_true',
-                        help='If a TL is detected but color is UNKNOWN and within engage distance, pre-brake conservatively')
-
-    # Presets to quickly set common combos
-    parser.add_argument('--preset', type=str, default=None, choices=['fast','quality','gpu480','cpu480'],
-                        help='Quick config: fast|quality|gpu480|cpu480')
-
-    # Telemetry options
-    parser.add_argument('--telemetry-csv', type=str, default=None,
-                        help='Write telemetry CSV with control/safety signals to this path')
-    parser.add_argument('--telemetry-hz', type=float, default=10.0,
-                        help='Telemetry logging frequency in Hz (default 10)')
-    parser.add_argument('--log-interval-frames', type=int, default=5,
-                        help='Print a concise state line to the console every N frames (0 to disable)')
-
-    # Scenario / results logging options
-    parser.add_argument('--scenario-tag', type=str, default='default',
-                        help='Freeform tag to identify this run/scenario in results CSVs')
-    parser.add_argument('--scenario-csv', type=str, default=None,
-                        help='If set, write high-level braking episode summaries to this CSV path')
-
-    # Ablation knob: artificial extra latency added to safety-envelope computation
-    parser.add_argument('--extra-latency-ms', type=float, default=0.0,
-                        help='Artificial extra latency (ms) added in safety envelope for sensitivity studies')
-
-    # Detector selection (future extension: MobileNetSSD, etc.)
-    parser.add_argument('--detector', type=str, default='yolo', choices=['yolo'],
-                        help='Perception backend: currently only "yolo" is implemented; hook for future detectors')
-
-    # NPC options
-    parser.add_argument('--npc-vehicles', type=int, default=15, help='Number of NPC vehicles to spawn')
-    parser.add_argument('--npc-walkers', type=int, default=5, help='Number of NPC walkers to spawn')
-    parser.add_argument('--npc-seed', type=int, default=None, help='Random seed for NPC spawning')
-    parser.add_argument('--npc-disable-autopilot', action='store_true', help='Spawn vehicles without autopilot')
-    parser.add_argument('--npc-speed-diff-pct', type=int, default=10, help='TrafficManager global percentage speed difference (0..100)')
-
-    return parser.parse_args()
-
-
-def _apply_preset(args):
-    """Mutate parsed args based on a chosen preset."""
-    if not args.preset:
-        return args
-    p = args.preset
-    if p == 'fast':
-        args.yolo_img = 480
-        args.yolo_device = 'cuda' if (torch is not None and hasattr(torch, 'cuda') and torch.cuda.is_available()) else 'cpu'
-        args.yolo_half = (args.yolo_device.startswith('cuda'))
-        args.yolo_agnostic = True
-        args.yolo_max_det = 150
-        args.stereo_cuda = False
-        args.range_est = 'depth'
-    elif p == 'quality':
-        args.yolo_img = 640
-        args.yolo_device = 'cuda' if (torch is not None and hasattr(torch, 'cuda') and torch.cuda.is_available()) else 'cpu'
-        args.yolo_half = False
-        args.yolo_max_det = 300
-        args.yolo_augment = True
-        args.stereo_cuda = True
-        args.stereo_method = 'sgm'
-    elif p == 'gpu480':
-        args.yolo_img = 480
-        args.yolo_device = 'cuda'
-        args.yolo_half = True
-        args.range_est = 'pinhole'
-    elif p == 'cpu480':
-        args.yolo_img = 480
-        args.yolo_device = 'cpu'
-        args.yolo_half = False
-        args.range_est = 'depth'
-    return args
-
-
 if __name__ == '__main__':
     args = parse_args()
-    args = _apply_preset(args)
+    args = apply_preset(args)
     App(args).run()
