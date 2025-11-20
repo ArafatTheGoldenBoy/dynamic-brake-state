@@ -8,6 +8,9 @@ import numpy as np
 import pygame
 import cv2
 
+from calibrations import load_aeb_calibration
+from ecu import ActuationECU, MessageBus, PerceptionECU, PlanningECU
+
 # Ensure CARLA Python egg is on sys.path before importing carla (supports common layouts)
 try:
     import carla  # type: ignore
@@ -1997,6 +2000,16 @@ class App:
             self.abs_actuator = PISlipABSActuator(dt=DT)
         else:
             self.abs_actuator = AdaptivePISlipABSActuator(dt=DT)
+        # ECU adapters make the perception/control/actuation responsibilities explicit.
+        self.bus = MessageBus()
+        self.bus_latency_perception = max(0.0, float(getattr(self.args, 'bus_latency_perception', 0.0)))
+        self.bus_latency_planning = max(0.0, float(getattr(self.args, 'bus_latency_planning', 0.0)))
+        self.perception_ecu = PerceptionECU(self._perception_step)
+        self.planning_ecu = PlanningECU(self._control_step)
+        self.actuation_ecu = ActuationECU(
+            abs_fn=(None if self.abs_actuator is None else self.abs_actuator.step),
+            abs_debug_fn=(None if self.abs_actuator is None else self.abs_actuator.debug_metrics),
+        )
         self._lead_tracker = LeadMultiObjectTracker(dt=DT)
         # Telemetry set up
         self.telemetry: Optional[_TelemetryLogger] = None
@@ -2033,51 +2046,29 @@ class App:
         except Exception:
             self.stereo_roi_shrink = STEREO_ROI_SHRINK_DEFAULT
 
-        # Decision-layer tuning knobs
-        try:
-            self.min_aeb_speed = max(0.0, float(getattr(self.args, 'min_aeb_speed', V_AEB_MIN_DEFAULT)))
-        except Exception:
-            self.min_aeb_speed = V_AEB_MIN_DEFAULT
-        try:
-            self.gate_confirm_frames = max(1, int(getattr(self.args, 'gate_confirm_frames', GATE_CONFIRM_FRAMES_DEFAULT)))
-        except Exception:
-            self.gate_confirm_frames = GATE_CONFIRM_FRAMES_DEFAULT
-        try:
-            self.ttc_confirm_s = max(0.5, float(getattr(self.args, 'ttc_confirm_s', TTC_CONFIRM_S_DEFAULT)))
-        except Exception:
-            self.ttc_confirm_s = TTC_CONFIRM_S_DEFAULT
-        try:
-            self.ttc_stage_strong = max(0.1, float(getattr(self.args, 'ttc_stage_strong', TTC_STAGE_STRONG_DEFAULT)))
-        except Exception:
-            self.ttc_stage_strong = TTC_STAGE_STRONG_DEFAULT
-        try:
-            self.ttc_stage_full = max(0.05, float(getattr(self.args, 'ttc_stage_full', TTC_STAGE_FULL_DEFAULT)))
-        except Exception:
-            self.ttc_stage_full = TTC_STAGE_FULL_DEFAULT
-        # Ensure ordering: full < strong <= confirm
-        if self.ttc_stage_strong <= self.ttc_stage_full:
-            self.ttc_stage_strong = self.ttc_stage_full + 0.05
-        self.ttc_stage_strong = min(self.ttc_confirm_s, self.ttc_stage_strong)
-        if self.ttc_stage_full >= self.ttc_stage_strong:
-            self.ttc_stage_full = max(0.1, self.ttc_stage_strong - 0.05)
-        try:
-            self.stage_factor_comfort = max(0.1, min(0.95, float(getattr(self.args, 'aeb_stage_comfort', BRAKE_STAGE_COMFORT_FACTOR))))
-        except Exception:
-            self.stage_factor_comfort = BRAKE_STAGE_COMFORT_FACTOR
-        try:
-            self.stage_factor_strong = max(self.stage_factor_comfort + 0.01,
-                                           min(0.99, float(getattr(self.args, 'aeb_stage_strong', BRAKE_STAGE_STRONG_FACTOR))))
-        except Exception:
-            self.stage_factor_strong = BRAKE_STAGE_STRONG_FACTOR
+        # Decision-layer tuning knobs, validated via calibration payloads
+        cal_defaults = {
+            'min_aeb_speed': getattr(self.args, 'min_aeb_speed', V_AEB_MIN_DEFAULT),
+            'gate_confirm_frames': getattr(self.args, 'gate_confirm_frames', GATE_CONFIRM_FRAMES_DEFAULT),
+            'ttc_confirm_s': getattr(self.args, 'ttc_confirm_s', TTC_CONFIRM_S_DEFAULT),
+            'ttc_stage_strong': getattr(self.args, 'ttc_stage_strong', TTC_STAGE_STRONG_DEFAULT),
+            'ttc_stage_full': getattr(self.args, 'ttc_stage_full', TTC_STAGE_FULL_DEFAULT),
+            'stage_factor_comfort': getattr(self.args, 'aeb_stage_comfort', BRAKE_STAGE_COMFORT_FACTOR),
+            'stage_factor_strong': getattr(self.args, 'aeb_stage_strong', BRAKE_STAGE_STRONG_FACTOR),
+            'aeb_ramp_up': getattr(self.args, 'aeb_ramp_up', AEB_RAMP_UP_DEFAULT),
+            'aeb_ramp_down': getattr(self.args, 'aeb_ramp_down', AEB_RAMP_DOWN_DEFAULT),
+        }
+        self.calibration = load_aeb_calibration(getattr(self.args, 'calibration_file', None), cal_defaults)
+        self.min_aeb_speed = self.calibration.min_aeb_speed
+        self.gate_confirm_frames = self.calibration.gate_confirm_frames
+        self.ttc_confirm_s = self.calibration.ttc_confirm_s
+        self.ttc_stage_strong = self.calibration.ttc_stage_strong
+        self.ttc_stage_full = self.calibration.ttc_stage_full
+        self.stage_factor_comfort = self.calibration.stage_factor_comfort
+        self.stage_factor_strong = self.calibration.stage_factor_strong
         self.stage_factor_full = BRAKE_STAGE_FULL_FACTOR
-        try:
-            self.aeb_ramp_up = max(0.5, float(getattr(self.args, 'aeb_ramp_up', AEB_RAMP_UP_DEFAULT)))
-        except Exception:
-            self.aeb_ramp_up = AEB_RAMP_UP_DEFAULT
-        try:
-            self.aeb_ramp_down = max(0.5, float(getattr(self.args, 'aeb_ramp_down', AEB_RAMP_DOWN_DEFAULT)))
-        except Exception:
-            self.aeb_ramp_down = AEB_RAMP_DOWN_DEFAULT
+        self.aeb_ramp_up = self.calibration.aeb_ramp_up
+        self.aeb_ramp_down = self.calibration.aeb_ramp_down
 
         self._gate_confirm_counter = 0
         self._hazard_confirm_since = -1.0
@@ -3171,10 +3162,29 @@ class App:
                 detect_ms = None
                 detect_t0 = time.time()
                 self._frame_index += 1
-                perc = self._perception_step(bgr, depth_m, depth_stereo_m, FX_, FY_, CX_, CY_,
-                                             sim_time, sensor_timestamp, v, MU, log_both, csv_w,
-                                             tele_bgr=tele_bgr, tele_depth_m=tele_depth_m)
+                perc = self.perception_ecu.process(
+                    bgr,
+                    depth_m,
+                    depth_stereo_m,
+                    FX_,
+                    FY_,
+                    CX_,
+                    CY_,
+                    sim_time,
+                    sensor_timestamp,
+                    v,
+                    MU,
+                    log_both,
+                    csv_w,
+                    tele_bgr=tele_bgr,
+                    tele_depth_m=tele_depth_m,
+                )
                 detect_ms = (time.time() - detect_t0) * 1000.0
+                perc.frame_id = self._frame_index
+                perc.validate()
+                self.bus.send('perception', perc, now=sim_time, latency_s=self.bus_latency_perception)
+                perc_bus = self.bus.receive_latest('perception', now=sim_time, max_age_s=0.3)
+                perc = perc_bus or perc
                 bgr = perc['bgr']
                 det_points = perc['det_points']
                 nearest_s_active = perc['nearest_s_active']
@@ -3253,30 +3263,77 @@ class App:
 
                 trigger_name = nearest_kind
 
-                # Control step via helper
-                throttle, brake, ctrl, hold_blocked, hold_reason, stop_armed, stop_latch_time, stop_release_ignore_until, dbg_map, I_err = \
-                    self._control_step(trigger_name, nearest_s_active, nearest_thr,
-                                       tl_state, tl_s_active, v, v_target, MU, ema_loop_ms,
-                                       tracked_distance_for_control, stop_armed, stop_latch_time, stop_release_ignore_until,
-                                       red_green_since, no_trigger_elapsed, no_red_elapsed,
-                                       depth_m, depth_stereo_m, nearest_box, nearest_conf,
-                                       I_err, v_prev)
+                # Control step via helper (conceptually ADAS domain ECU → Brake ECU request)
+                planning_decision = self.planning_ecu.plan(
+                    trigger_name,
+                    nearest_s_active,
+                    nearest_thr,
+                    tl_state,
+                    tl_s_active,
+                    v,
+                    v_target,
+                    MU,
+                    ema_loop_ms,
+                    tracked_distance_for_control,
+                    stop_armed,
+                    stop_latch_time,
+                    stop_release_ignore_until,
+                    red_green_since,
+                    no_trigger_elapsed,
+                    no_red_elapsed,
+                    depth_m,
+                    depth_stereo_m,
+                    nearest_box,
+                    nearest_conf,
+                    I_err,
+                    v_prev,
+                )
+                planning_decision.validate()
+                self.bus.send('planning', planning_decision, now=sim_time, latency_s=self.bus_latency_planning)
+                planning_from_bus = self.bus.receive_latest('planning', now=sim_time, max_age_s=0.3)
+                if planning_from_bus is not None:
+                    planning_decision = planning_from_bus
+                if not planning_decision.valid:
+                    planning_decision.brake = max(planning_decision.brake, 1.0)
+                    planning_decision.throttle = 0.0
+                throttle = planning_decision.throttle
+                brake = planning_decision.brake
+                ctrl = planning_decision.ctrl
+                hold_blocked = planning_decision.hold_blocked
+                hold_reason = planning_decision.hold_reason
+                stop_armed = planning_decision.stop_armed
+                stop_latch_time = planning_decision.stop_latch_time
+                stop_release_ignore_until = planning_decision.stop_release_ignore_until
+                dbg_map = planning_decision.debug
+                I_err = planning_decision.integral_error
+                perception_latency_ms = (time.time() - perc.timestamp) * 1000.0 if hasattr(perc, 'timestamp') else None
+                planning_latency_ms = (time.time() - planning_decision.timestamp) * 1000.0
+                dbg_map = dict(dbg_map or {})
+                dbg_map['perception_bus_latency_ms'] = perception_latency_ms
+                dbg_map['planning_bus_latency_ms'] = planning_latency_ms
+                dbg_map['planning_valid'] = planning_decision.valid
+                if planning_decision.aeb_request is not None:
+                    dbg_map['aeb_request'] = {
+                        'mode': planning_decision.aeb_request.mode,
+                        'target_decel': planning_decision.aeb_request.target_decel,
+                        'priority': planning_decision.aeb_request.priority,
+                    }
                 abs_lambda = None
                 abs_factor = None
                 abs_mu = None
                 abs_regime = 'off' if self.abs_actuator is None else None
                 abs_dbg = None
-                if self.abs_actuator is not None:
-                    try:
-                        brake = self.abs_actuator.step(brake, v, wheel_speeds, a_long)
-                        abs_dbg = self.abs_actuator.debug_metrics()
-                    except Exception:
-                        abs_dbg = None
-                    if abs_dbg is not None:
-                        abs_lambda = abs_dbg.get('lambda_max')
-                        abs_factor = abs_dbg.get('f_global')
-                        abs_mu = abs_dbg.get('mu_est')
-                        abs_regime = abs_dbg.get('regime')
+                abs_result = self.actuation_ecu.apply_abs(brake, v, wheel_speeds, a_long)
+                brake = abs_result.get('brake', brake)
+                abs_dbg = abs_result.get('abs_dbg')
+                if not abs_result.valid:
+                    brake = max(brake, 1.0)
+                    dbg_map['abs_fault'] = abs_result.fault_code or 'UNKNOWN_ABS_FAULT'
+                if abs_dbg is not None:
+                    abs_lambda = abs_dbg.get('lambda_max')
+                    abs_factor = abs_dbg.get('f_global')
+                    abs_mu = abs_dbg.get('mu_est')
+                    abs_regime = abs_dbg.get('regime')
 
                 # If a new brake command crosses the threshold, start measuring actuation latency
                 brake_cmd_for_latency = float(brake)
@@ -3711,6 +3768,10 @@ def parse_args():
     parser.add_argument('--mu', type=float, default=MU_DEFAULT, help='Road friction estimate (dry~0.9, wet~0.6, ice~0.2)')
     parser.add_argument('--abs-mode', type=str, default='adaptive', choices=['off','fixed','adaptive'],
                         help='Slip controller: off (direct brake), fixed PI ABS, or μ-adaptive PI ABS')
+    parser.add_argument('--bus-latency-perception', type=float, default=0.0,
+                        help='Simulated bus latency (seconds) from perception ECU to planning ECU')
+    parser.add_argument('--bus-latency-planning', type=float, default=0.0,
+                        help='Simulated bus latency (seconds) from planning ECU to actuation ECU')
     parser.add_argument('--apply-tire-friction', action='store_true',
                         help='Also set wheel.tire_friction≈mu to make the sim physically slick.')
     parser.add_argument('--persist-frames', type=int, default=2,
@@ -3733,6 +3794,8 @@ def parse_args():
                         help='Max increase rate for a_des (m/s^2 per second) when escalating braking')
     parser.add_argument('--aeb-ramp-down', type=float, default=AEB_RAMP_DOWN_DEFAULT,
                         help='Max decrease rate for a_des (m/s^2 per second) when relaxing braking')
+    parser.add_argument('--calibration-file', type=str, default=None,
+                        help='Optional JSON file containing validated AEB planning calibration values')
     parser.add_argument('--range-est', type=str, default='pinhole',
                         choices=['pinhole', 'depth', 'stereo', 'both'],
                         help='Distance source: monocular pinhole, CARLA depth, stereo vision, or log both (depth vs pinhole)')
