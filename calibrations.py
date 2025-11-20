@@ -7,9 +7,10 @@ structures can be loaded by :func:`load_aeb_calibration`.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 
 @dataclass
@@ -39,10 +40,13 @@ class AEBPlanningCalibration:
 
 def load_aeb_calibration(path: str | None, defaults: Dict[str, Any]) -> AEBPlanningCalibration:
     cfg: Dict[str, Any] = dict(defaults)
+    checksum: Tuple[str, str] | None = None
     if path:
         try:
             with open(path, "r") as fp:
-                loaded = json.load(fp)
+                blob = fp.read()
+                checksum = ("sha256", hashlib.sha256(blob.encode("utf-8")).hexdigest())
+                loaded = json.loads(blob)
             if isinstance(loaded, dict):
                 cfg.update({k: v for k, v in loaded.items() if k in cfg})
                 cfg["metadata"] = {
@@ -51,6 +55,9 @@ def load_aeb_calibration(path: str | None, defaults: Dict[str, Any]) -> AEBPlann
                 }
         except Exception as exc:
             cfg["metadata"] = {"source": path, "error": str(exc)}
+    if checksum:
+        cfg.setdefault("metadata", {})["checksum"] = {checksum[0]: checksum[1]}
+    cfg.setdefault("metadata", {})["schema_version"] = "1.0"
     calibration = AEBPlanningCalibration(**cfg)
     calibration.clamp_and_validate()
     return calibration

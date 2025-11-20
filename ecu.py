@@ -10,9 +10,10 @@ behavior unchanged while clarifying which subsystem owns which responsibility.
 from __future__ import annotations
 
 import math
+import random
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 
 def _clamp(value: float, bounds: Tuple[float, float]) -> float:
@@ -46,6 +47,12 @@ class PerceptionSignal:
     frame_id: Optional[int] = None
     valid: bool = True
     fault_code: Optional[str] = None
+    freshness_s: float = 0.5
+    units: Dict[str, str] = field(default_factory=lambda: {
+        "nearest_s_active": "m",
+        "nearest_conf": "[0,1]",
+        "tl_s_active": "m",
+    })
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
@@ -53,16 +60,21 @@ class PerceptionSignal:
     def get(self, key: str, default=None):
         return getattr(self, key, default)
 
-    def validate(self, freshness_s: float = 0.5) -> None:
+    def validate(self, freshness_s: Optional[float] = None) -> None:
         now = time.time()
-        if not math.isfinite(self.timestamp) or (now - float(self.timestamp) > freshness_s):
+        freshness = self.freshness_s if freshness_s is None else freshness_s
+        if not math.isfinite(self.timestamp) or (now - float(self.timestamp) > freshness):
             self.valid = False
             self.fault_code = self.fault_code or "STALE_PERCEPTION"
-        if self.nearest_s_active is not None and self.nearest_s_active < 0:
-            self.valid = False
-            self.fault_code = self.fault_code or "NEGATIVE_DISTANCE"
+        if self.nearest_s_active is not None:
+            if not math.isfinite(self.nearest_s_active) or self.nearest_s_active < 0:
+                self.valid = False
+                self.fault_code = self.fault_code or "NEGATIVE_DISTANCE"
         if self.nearest_conf is not None:
             self.nearest_conf = _clamp(float(self.nearest_conf), (0.0, 1.0))
+        if self.tl_s_active is not None and self.tl_s_active < 0:
+            self.valid = False
+            self.fault_code = self.fault_code or "TL_DISTANCE_INVALID"
 
 
 @dataclass
@@ -72,6 +84,7 @@ class AEBRequest:
     mode: str
     target_decel: float
     priority: str = "HIGH"
+    units: Dict[str, str] = field(default_factory=lambda: {"target_decel": "m/s^2"})
 
     def validate(self) -> None:
         self.target_decel = float(self.target_decel)
@@ -98,6 +111,10 @@ class PlanningDecision:
     timestamp: float = field(default_factory=lambda: time.time())
     valid: bool = True
     fault_code: Optional[str] = None
+    units: Dict[str, str] = field(default_factory=lambda: {
+        "throttle": "[0,1]",
+        "brake": "[0,1]",
+    })
 
     def validate(self) -> None:
         if not math.isfinite(self.timestamp):
@@ -136,12 +153,19 @@ class ActuationResult:
     fault_code: Optional[str] = None
     timestamp: float = field(default_factory=lambda: time.time())
     valid: bool = True
+    freshness_s: float = 0.5
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
 
     def get(self, key: str, default=None):
         return getattr(self, key, default)
+
+    def validate(self) -> None:
+        if not math.isfinite(self.timestamp):
+            self.valid = False
+            self.fault_code = self.fault_code or "ACT_TS_INVALID"
+        self.brake = _clamp(float(self.brake), (0.0, 1.0))
 
 
 @dataclass
@@ -272,27 +296,122 @@ class ActuationECU:
 
 
 class MessageBus:
-    """Simple in-process bus that mimics ECU message passing with latency."""
+    """In-process bus that approximates ECU message passing with faults."""
 
     def __init__(self):
-        self._queues: Dict[str, list] = {}
+        self._queues: Dict[str, List[Tuple[float, int, Any]]] = {}
+        self._topic_config: Dict[str, Dict[str, float]] = {}
+        self.metrics: Dict[str, Dict[str, float]] = {}
 
-    def send(self, topic: str, message: Any, now: Optional[float] = None, latency_s: float = 0.0) -> None:
+    def configure_topic(
+        self,
+        topic: str,
+        drop_rate: float = 0.0,
+        jitter_s: float = 0.0,
+        max_age_s: float = 0.5,
+        max_depth: int = 8,
+    ) -> None:
+        self._topic_config[topic] = {
+            "drop_rate": max(0.0, min(1.0, drop_rate)),
+            "jitter_s": max(0.0, jitter_s),
+            "max_age_s": max(0.05, max_age_s),
+            "max_depth": max(1, max_depth),
+        }
+        self.metrics[topic] = {
+            "sent": 0,
+            "dropped_tx": 0,
+            "delivered": 0,
+            "expired": 0,
+        }
+
+    def _cfg(self, topic: str) -> Dict[str, float]:
+        if topic not in self._topic_config:
+            self.configure_topic(topic)
+        return self._topic_config[topic]
+
+    def send(
+        self,
+        topic: str,
+        message: Any,
+        now: Optional[float] = None,
+        latency_s: float = 0.0,
+    ) -> None:
+        cfg = self._cfg(topic)
+        if random.random() < cfg["drop_rate"]:
+            self.metrics[topic]["dropped_tx"] += 1
+            return
         deliver_at = (now if now is not None else time.time()) + max(0.0, latency_s)
-        self._queues.setdefault(topic, []).append((deliver_at, message))
+        if cfg["jitter_s"] > 0.0:
+            deliver_at += random.uniform(-cfg["jitter_s"], cfg["jitter_s"])
+        q = self._queues.setdefault(topic, [])
+        q.append((deliver_at, len(q), message))
+        if len(q) > cfg["max_depth"]:
+            q.pop(0)
+        self.metrics[topic]["sent"] += 1
 
-    def receive_latest(self, topic: str, now: Optional[float] = None, max_age_s: float = 0.5) -> Optional[Any]:
+    def receive_latest(
+        self, topic: str, now: Optional[float] = None, max_age_s: Optional[float] = None
+    ) -> Optional[Any]:
+        cfg = self._cfg(topic)
+        max_age = cfg["max_age_s"] if max_age_s is None else max_age_s
         now_ts = now if now is not None else time.time()
         queue = self._queues.get(topic, [])
-        ready = [(ts, msg) for ts, msg in queue if ts <= now_ts]
+        ready = [(ts, prio, msg) for ts, prio, msg in queue if ts <= now_ts]
         if not ready:
             return None
-        # Keep only delivered messages and drop stale ones beyond max_age
-        self._queues[topic] = [(ts, msg) for ts, msg in queue if ts > now_ts]
-        ready.sort(key=lambda t: t[0])
-        _, latest = ready[-1]
+        self._queues[topic] = [(ts, prio, msg) for ts, prio, msg in queue if ts > now_ts]
+        ready.sort(key=lambda t: (t[0], t[1]))
+        _, _, latest = ready[-1]
         age = now_ts - latest.timestamp if hasattr(latest, "timestamp") else 0.0
-        if age > max_age_s:
+        if age > max_age:
+            self.metrics[topic]["expired"] += 1
             return None
+        self.metrics[topic]["delivered"] += 1
         return latest
+
+
+@dataclass
+class SafetyDecision:
+    throttle: float
+    brake: float
+    mode: str
+    faults: List[str] = field(default_factory=list)
+
+
+class SafetyManager:
+    """Aggregates ECU faults and enforces degraded behavior."""
+
+    def __init__(self, brake_fail_safe: float = 1.0):
+        self.brake_fail_safe = _clamp(brake_fail_safe, (0.5, 1.0))
+        self.latched_faults: List[str] = []
+
+    def _latch(self, code: Optional[str]) -> None:
+        if code and code not in self.latched_faults:
+            self.latched_faults.append(code)
+
+    def evaluate(
+        self,
+        perception: Optional[PerceptionSignal],
+        planning: Optional[PlanningDecision],
+        actuation: Optional[ActuationResult],
+    ) -> SafetyDecision:
+        if perception is not None and (not perception.valid or perception.fault_code):
+            self._latch(perception.fault_code or "PERCEPTION_INVALID")
+        if planning is not None and (not planning.valid or planning.fault_code):
+            self._latch(planning.fault_code or "PLANNING_INVALID")
+        if actuation is not None and (not actuation.valid or actuation.fault_code):
+            self._latch(actuation.fault_code or "ACTUATION_INVALID")
+        faults = list(self.latched_faults)
+
+        degrade = any(faults)
+        if degrade:
+            throttle_cmd = 0.0
+            brake_cmd = self.brake_fail_safe
+            mode = "DEGRADED_FAIL_SAFE"
+        else:
+            throttle_cmd = planning.throttle if planning is not None else 0.0
+            brake_cmd = planning.brake if planning is not None else 0.0
+            mode = "NOMINAL"
+
+        return SafetyDecision(throttle=throttle_cmd, brake=brake_cmd, mode=mode, faults=faults)
 

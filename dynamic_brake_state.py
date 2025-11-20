@@ -9,7 +9,7 @@ import pygame
 import cv2
 
 from calibrations import load_aeb_calibration
-from ecu import ActuationECU, MessageBus, PerceptionECU, PlanningECU
+from ecu import ActuationECU, MessageBus, PerceptionECU, PlanningECU, SafetyManager
 
 # Ensure CARLA Python egg is on sys.path before importing carla (supports common layouts)
 try:
@@ -2004,12 +2004,25 @@ class App:
         self.bus = MessageBus()
         self.bus_latency_perception = max(0.0, float(getattr(self.args, 'bus_latency_perception', 0.0)))
         self.bus_latency_planning = max(0.0, float(getattr(self.args, 'bus_latency_planning', 0.0)))
+        self.bus.configure_topic(
+            'perception',
+            drop_rate=max(0.0, min(1.0, float(getattr(self.args, 'bus_drop_perception', 0.0)))),
+            jitter_s=max(0.0, float(getattr(self.args, 'bus_jitter_perception', 0.0))),
+            max_age_s=0.3,
+        )
+        self.bus.configure_topic(
+            'planning',
+            drop_rate=max(0.0, min(1.0, float(getattr(self.args, 'bus_drop_planning', 0.0)))),
+            jitter_s=max(0.0, float(getattr(self.args, 'bus_jitter_planning', 0.0))),
+            max_age_s=0.3,
+        )
         self.perception_ecu = PerceptionECU(self._perception_step)
         self.planning_ecu = PlanningECU(self._control_step)
         self.actuation_ecu = ActuationECU(
             abs_fn=(None if self.abs_actuator is None else self.abs_actuator.step),
             abs_debug_fn=(None if self.abs_actuator is None else self.abs_actuator.debug_metrics),
         )
+        self.safety_manager = SafetyManager()
         self._lead_tracker = LeadMultiObjectTracker(dt=DT)
         # Telemetry set up
         self.telemetry: Optional[_TelemetryLogger] = None
@@ -3312,6 +3325,10 @@ class App:
                 dbg_map['perception_bus_latency_ms'] = perception_latency_ms
                 dbg_map['planning_bus_latency_ms'] = planning_latency_ms
                 dbg_map['planning_valid'] = planning_decision.valid
+                dbg_map['bus_metrics'] = {
+                    'perception': dict(self.bus.metrics.get('perception', {})),
+                    'planning': dict(self.bus.metrics.get('planning', {})),
+                }
                 if planning_decision.aeb_request is not None:
                     dbg_map['aeb_request'] = {
                         'mode': planning_decision.aeb_request.mode,
@@ -3324,11 +3341,20 @@ class App:
                 abs_regime = 'off' if self.abs_actuator is None else None
                 abs_dbg = None
                 abs_result = self.actuation_ecu.apply_abs(brake, v, wheel_speeds, a_long)
+                abs_result.validate()
                 brake = abs_result.get('brake', brake)
                 abs_dbg = abs_result.get('abs_dbg')
+                planning_decision.brake = brake
                 if not abs_result.valid:
                     brake = max(brake, 1.0)
                     dbg_map['abs_fault'] = abs_result.fault_code or 'UNKNOWN_ABS_FAULT'
+                safety = self.safety_manager.evaluate(perc, planning_decision, abs_result)
+                if safety.mode != 'NOMINAL':
+                    throttle = safety.throttle
+                    brake = max(brake, safety.brake)
+                dbg_map['safety_mode'] = safety.mode
+                if safety.faults:
+                    dbg_map['safety_faults'] = list(safety.faults)
                 if abs_dbg is not None:
                     abs_lambda = abs_dbg.get('lambda_max')
                     abs_factor = abs_dbg.get('f_global')
