@@ -1,5 +1,5 @@
 from __future__ import print_function
-import os, sys, math, argparse, random, queue, glob, csv
+import os, sys, math, argparse, random, queue, glob, csv, multiprocessing as mp
 import time, traceback
 from typing import Optional, Tuple, List, Dict, Any
 from collections import deque, Counter
@@ -9,7 +9,17 @@ import pygame
 import cv2
 
 from calibrations import load_aeb_calibration, load_bus_calibration, load_safety_calibration
-from ecu import ActuationECU, MessageBus, PerceptionECU, PlanningECU, SafetyManager
+from ecu import (
+    ActuationECU,
+    ActuationJob,
+    DistributedECUPipeline,
+    MessageBus,
+    PerceptionECU,
+    PerceptionJob,
+    PlanningECU,
+    PlanningJob,
+    SafetyManager,
+)
 
 # Ensure CARLA Python egg is on sys.path before importing carla (supports common layouts)
 try:
@@ -38,7 +48,8 @@ try:
 except Exception:
     _ULTRA_YOLO = None
 
-import torch 
+import torch
+from functools import partial
 
 # ===================== configuration =====================
 IMG_W, IMG_H      = 960, 540          # display pane size for primary/telephoto views
@@ -152,6 +163,57 @@ def compute_slip_per_wheel(v_ego: float, wheel_speeds: List[float]) -> List[floa
         lam = max(0.0, min(1.0, lam))
         slips.append(lam)
     return slips
+
+
+def _perception_job_handler(ecu: PerceptionECU, job: PerceptionJob) -> Any:
+    return ecu.process(
+        job.bgr,
+        job.depth_m,
+        job.depth_stereo_m,
+        job.fx,
+        job.fy,
+        job.cx,
+        job.cy,
+        job.sim_time,
+        job.sensor_timestamp,
+        job.v,
+        job.mu,
+        job.log_both,
+        job.csv_writer,
+        tele_bgr=job.tele_bgr,
+        tele_depth_m=job.tele_depth_m,
+    )
+
+
+def _planning_job_handler(ecu: PlanningECU, job: PlanningJob) -> PlanningDecision:
+    return ecu.plan(
+        job.trigger_name,
+        job.nearest_s_active,
+        job.nearest_thr,
+        job.tl_state,
+        job.tl_s_active,
+        job.v,
+        job.v_target,
+        job.mu,
+        job.ema_loop_ms,
+        job.tracked_distance_for_control,
+        job.stop_armed,
+        job.stop_latch_time,
+        job.stop_release_ignore_until,
+        job.red_green_since,
+        job.no_trigger_elapsed,
+        job.no_red_elapsed,
+        job.depth_m,
+        job.depth_stereo_m,
+        job.nearest_box,
+        job.nearest_conf,
+        job.I_err,
+        job.v_prev,
+    )
+
+
+def _actuation_job_handler(ecu: ActuationECU, job: ActuationJob) -> ActuationResult:
+    return ecu.apply_abs(job.brake_cmd, job.v_ego, job.wheel_speeds, job.a_long)
 
 
 class PISlipChannel:
@@ -2001,7 +2063,10 @@ class App:
         else:
             self.abs_actuator = AdaptivePISlipABSActuator(dt=DT)
         # ECU adapters make the perception/control/actuation responsibilities explicit.
-        self.bus = MessageBus()
+        self.multiprocess_ecus = bool(getattr(self.args, 'multiprocess_ecus', False))
+        self.ecu_process_timeout = max(0.05, float(getattr(self.args, 'ecu_process_timeout', 0.35)))
+        self.bus_manager = mp.Manager() if self.multiprocess_ecus else None
+        self.bus = MessageBus(self.bus_manager)
         self.bus_latency_perception = max(0.0, float(getattr(self.args, 'bus_latency_perception', 0.0)))
         self.bus_latency_planning = max(0.0, float(getattr(self.args, 'bus_latency_planning', 0.0)))
         bus_defaults = {
@@ -2039,6 +2104,13 @@ class App:
             abs_fn=(None if self.abs_actuator is None else self.abs_actuator.step),
             abs_debug_fn=(None if self.abs_actuator is None else self.abs_actuator.debug_metrics),
         )
+        self.ecu_pipeline = None
+        if self.multiprocess_ecus:
+            self.ecu_pipeline = DistributedECUPipeline(
+                partial(_perception_job_handler, self.perception_ecu),
+                partial(_planning_job_handler, self.planning_ecu),
+                partial(_actuation_job_handler, self.actuation_ecu),
+            )
         safety_defaults = {
             'perception_freshness_s': float(getattr(self.args, 'perception_freshness_s', 0.35)),
             'planning_freshness_s': float(getattr(self.args, 'planning_freshness_s', 0.35)),
@@ -3210,23 +3282,61 @@ class App:
                 detect_ms = None
                 detect_t0 = time.time()
                 self._frame_index += 1
-                perc = self.perception_ecu.process(
-                    bgr,
-                    depth_m,
-                    depth_stereo_m,
-                    FX_,
-                    FY_,
-                    CX_,
-                    CY_,
-                    sim_time,
-                    sensor_timestamp,
-                    v,
-                    MU,
-                    log_both,
-                    csv_w,
-                    tele_bgr=tele_bgr,
-                    tele_depth_m=tele_depth_m,
-                )
+                if self.ecu_pipeline is not None:
+                    perc_job = PerceptionJob(
+                        bgr=bgr,
+                        depth_m=depth_m,
+                        depth_stereo_m=depth_stereo_m,
+                        fx=FX_,
+                        fy=FY_,
+                        cx=CX_,
+                        cy=CY_,
+                        sim_time=sim_time,
+                        sensor_timestamp=sensor_timestamp,
+                        v=v,
+                        mu=MU,
+                        log_both=log_both,
+                        csv_writer=csv_w,
+                        tele_bgr=tele_bgr,
+                        tele_depth_m=tele_depth_m,
+                    )
+                    try:
+                        perc = self.ecu_pipeline.run_perception(perc_job, timeout=self.ecu_process_timeout)
+                    except Exception as exc:
+                        perc = PerceptionSignal(
+                            bgr=bgr,
+                            det_points=[],
+                            nearest_s_active=None,
+                            nearest_kind=None,
+                            nearest_thr=None,
+                            nearest_box=None,
+                            nearest_conf=None,
+                            tl_state='UNKNOWN',
+                            tl_s_active=None,
+                            tl_det_box=None,
+                            stop_detected_current=False,
+                            fault_code=f'PERCEPTION_PROC_FAIL:{exc}',
+                            valid=False,
+                        )
+                        perc.timestamp = time.time()
+                else:
+                    perc = self.perception_ecu.process(
+                        bgr,
+                        depth_m,
+                        depth_stereo_m,
+                        FX_,
+                        FY_,
+                        CX_,
+                        CY_,
+                        sim_time,
+                        sensor_timestamp,
+                        v,
+                        MU,
+                        log_both,
+                        csv_w,
+                        tele_bgr=tele_bgr,
+                        tele_depth_m=tele_depth_m,
+                    )
                 detect_ms = (time.time() - detect_t0) * 1000.0
                 perc.frame_id = self._frame_index
                 perc.validate(freshness_s=self.safety_calibration.perception_freshness_s)
@@ -3312,30 +3422,75 @@ class App:
                 trigger_name = nearest_kind
 
                 # Control step via helper (conceptually ADAS domain ECU → Brake ECU request)
-                planning_decision = self.planning_ecu.plan(
-                    trigger_name,
-                    nearest_s_active,
-                    nearest_thr,
-                    tl_state,
-                    tl_s_active,
-                    v,
-                    v_target,
-                    MU,
-                    ema_loop_ms,
-                    tracked_distance_for_control,
-                    stop_armed,
-                    stop_latch_time,
-                    stop_release_ignore_until,
-                    red_green_since,
-                    no_trigger_elapsed,
-                    no_red_elapsed,
-                    depth_m,
-                    depth_stereo_m,
-                    nearest_box,
-                    nearest_conf,
-                    I_err,
-                    v_prev,
-                )
+                if self.ecu_pipeline is not None:
+                    plan_job = PlanningJob(
+                        trigger_name=trigger_name,
+                        nearest_s_active=nearest_s_active,
+                        nearest_thr=nearest_thr,
+                        tl_state=tl_state,
+                        tl_s_active=tl_s_active,
+                        v=v,
+                        v_target=v_target,
+                        mu=MU,
+                        ema_loop_ms=ema_loop_ms,
+                        tracked_distance_for_control=tracked_distance_for_control,
+                        stop_armed=stop_armed,
+                        stop_latch_time=stop_latch_time,
+                        stop_release_ignore_until=stop_release_ignore_until,
+                        red_green_since=red_green_since,
+                        no_trigger_elapsed=no_trigger_elapsed,
+                        no_red_elapsed=no_red_elapsed,
+                        depth_m=depth_m,
+                        depth_stereo_m=depth_stereo_m,
+                        nearest_box=nearest_box,
+                        nearest_conf=nearest_conf,
+                        I_err=I_err,
+                        v_prev=v_prev,
+                    )
+                    try:
+                        planning_decision = self.ecu_pipeline.run_planning(plan_job, timeout=self.ecu_process_timeout)
+                    except Exception as exc:
+                        planning_decision = PlanningDecision(
+                            throttle=0.0,
+                            brake=1.0,
+                            ctrl=None,
+                            hold_blocked=True,
+                            hold_reason=f'PLANNING_PROC_FAIL:{exc}',
+                            stop_armed=stop_armed,
+                            stop_latch_time=stop_latch_time,
+                            stop_release_ignore_until=stop_release_ignore_until,
+                            debug={},
+                            integral_error=I_err,
+                            aeb_request=None,
+                            valid=False,
+                            fault_code=f'PLANNING_PROC_FAIL:{exc}',
+                        )
+                        planning_decision.timestamp = time.time()
+                else:
+                    planning_decision = self.planning_ecu.plan(
+                        trigger_name,
+                        nearest_s_active,
+                        nearest_thr,
+                        tl_state,
+                        tl_s_active,
+                        v,
+                        v_target,
+                        MU,
+                        ema_loop_ms,
+                        tracked_distance_for_control,
+                        stop_armed,
+                        stop_latch_time,
+                        stop_release_ignore_until,
+                        red_green_since,
+                        no_trigger_elapsed,
+                        no_red_elapsed,
+                        depth_m,
+                        depth_stereo_m,
+                        nearest_box,
+                        nearest_conf,
+                        I_err,
+                        v_prev,
+                    )
                 planning_decision.validate(freshness_s=self.safety_calibration.planning_freshness_s)
                 self.bus.send('planning', planning_decision, now=sim_time, latency_s=self.bus_latency_planning)
                 planning_from_bus = self.bus.receive_latest('planning', now=sim_time, max_age_s=0.3)
@@ -3364,6 +3519,7 @@ class App:
                     'perception': dict(self.bus.metrics.get('perception', {})),
                     'planning': dict(self.bus.metrics.get('planning', {})),
                 }
+                dbg_map['ecu_process_mode'] = 'distributed' if self.ecu_pipeline is not None else 'in_process'
                 dbg_map['calibration_meta'] = {
                     'aeb': getattr(self.calibration, 'metadata', {}),
                     'safety': getattr(self.safety_calibration, 'metadata', {}),
@@ -3380,7 +3536,15 @@ class App:
                 abs_mu = None
                 abs_regime = 'off' if self.abs_actuator is None else None
                 abs_dbg = None
-                abs_result = self.actuation_ecu.apply_abs(brake, v, wheel_speeds, a_long)
+                if self.ecu_pipeline is not None:
+                    abs_job = ActuationJob(brake_cmd=brake, v_ego=v, wheel_speeds=wheel_speeds, a_long=a_long)
+                    try:
+                        abs_result = self.ecu_pipeline.run_actuation(abs_job, timeout=self.ecu_process_timeout)
+                    except Exception as exc:
+                        abs_result = ActuationResult(brake=brake, abs_dbg=None, fault_code=f'ACT_PROC_FAIL:{exc}', valid=False)
+                        abs_result.timestamp = time.time()
+                else:
+                    abs_result = self.actuation_ecu.apply_abs(brake, v, wheel_speeds, a_long)
                 abs_result.validate(freshness_s=self.safety_calibration.actuation_freshness_s)
                 brake = abs_result.get('brake', brake)
                 abs_dbg = abs_result.get('abs_dbg')
@@ -3852,6 +4016,10 @@ def parse_args():
                         help='Deadline (seconds) for consuming perception messages before counting a miss')
     parser.add_argument('--bus-deadline-planning', type=float, default=0.15,
                         help='Deadline (seconds) for consuming planning messages before counting a miss')
+    parser.add_argument('--multiprocess-ecus', action='store_true', default=False,
+                        help='Run perception/planning/actuation ECUs in separate OS processes connected by queues')
+    parser.add_argument('--ecu-process-timeout', type=float, default=0.35,
+                        help='Timeout (seconds) for ECU process replies before falling back to safe defaults')
     parser.add_argument('--bus-calibration-file', type=str, default=None,
                         help='Optional JSON file describing bus topic configs (drop, jitter, max_age, deadline, priority)')
     parser.add_argument('--safety-calibration-file', type=str, default=None,

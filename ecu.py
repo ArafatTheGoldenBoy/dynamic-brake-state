@@ -10,6 +10,8 @@ behavior unchanged while clarifying which subsystem owns which responsibility.
 from __future__ import annotations
 
 import math
+import multiprocessing as mp
+import queue as queue_mod
 import random
 import time
 from dataclasses import dataclass, field
@@ -334,12 +336,19 @@ class ActuationECU:
 
 
 class MessageBus:
-    """In-process bus that approximates ECU message passing with faults."""
+    """Bus that approximates ECU message passing with optional shared state."""
 
-    def __init__(self):
-        self._queues: Dict[str, List[Tuple[float, int, int, Any]]] = {}
-        self._topic_config: Dict[str, Dict[str, float]] = {}
-        self.metrics: Dict[str, Dict[str, float]] = {}
+    def __init__(self, shared_manager: Optional[mp.Manager] = None):
+        self._manager = shared_manager
+        if shared_manager is None:
+            self._queues: Dict[str, List[Tuple[float, int, int, Any]]] = {}
+            self._topic_config: Dict[str, Dict[str, float]] = {}
+            self.metrics: Dict[str, Dict[str, float]] = {}
+        else:
+            self._queues = shared_manager.dict()
+            self._topic_config = shared_manager.dict()
+            self.metrics = shared_manager.dict()
+        self._locks: Dict[str, mp.Lock] = {}
 
     def configure_topic(
         self,
@@ -351,7 +360,7 @@ class MessageBus:
         deadline_s: float = 0.25,
         priority: int = 0,
     ) -> None:
-        self._topic_config[topic] = {
+        cfg = {
             "drop_rate": max(0.0, min(1.0, drop_rate)),
             "jitter_s": max(0.0, jitter_s),
             "max_age_s": max(0.05, max_age_s),
@@ -359,7 +368,8 @@ class MessageBus:
             "deadline_s": max(0.01, deadline_s),
             "priority": max(0, priority),
         }
-        self.metrics[topic] = {
+        self._topic_config[topic] = cfg
+        metrics_payload = {
             "sent": 0,
             "dropped_tx": 0,
             "delivered": 0,
@@ -367,6 +377,15 @@ class MessageBus:
             "expired": 0,
             "queue_depth": 0,
         }
+        if self._manager is None:
+            self.metrics[topic] = metrics_payload
+            self._queues.setdefault(topic, [])
+        else:
+            self.metrics[topic] = self._manager.dict(metrics_payload)
+            if topic not in self._queues:
+                self._queues[topic] = self._manager.list()
+        if topic not in self._locks:
+            self._locks[topic] = mp.Lock()
 
     def _cfg(self, topic: str) -> Dict[str, float]:
         if topic not in self._topic_config:
@@ -383,17 +402,18 @@ class MessageBus:
     ) -> None:
         cfg = self._cfg(topic)
         if random.random() < cfg["drop_rate"]:
-            self.metrics[topic]["dropped_tx"] += 1
+            self.metrics[topic]["dropped_tx"] = self.metrics[topic]["dropped_tx"] + 1
             return
         deliver_at = (now if now is not None else time.time()) + max(0.0, latency_s)
         if cfg["jitter_s"] > 0.0:
             deliver_at += random.uniform(-cfg["jitter_s"], cfg["jitter_s"])
-        q = self._queues.setdefault(topic, [])
-        q.append((deliver_at, priority if priority is not None else cfg["priority"], len(q), message))
-        if len(q) > cfg["max_depth"]:
-            q.pop(0)
-        self.metrics[topic]["sent"] += 1
-        self.metrics[topic]["queue_depth"] = len(q)
+        with self._locks[topic]:
+            q = self._queues.setdefault(topic, [] if self._manager is None else self._manager.list())
+            q.append((deliver_at, priority if priority is not None else cfg["priority"], len(q), message))
+            if len(q) > cfg["max_depth"]:
+                q.pop(0)
+            self.metrics[topic]["sent"] = self.metrics[topic]["sent"] + 1
+            self.metrics[topic]["queue_depth"] = len(q)
 
     def receive_latest(
         self, topic: str, now: Optional[float] = None, max_age_s: Optional[float] = None
@@ -401,22 +421,203 @@ class MessageBus:
         cfg = self._cfg(topic)
         max_age = cfg["max_age_s"] if max_age_s is None else max_age_s
         now_ts = now if now is not None else time.time()
-        queue = self._queues.get(topic, [])
-        ready = [(ts, prio, idx, msg) for ts, prio, idx, msg in queue if ts <= now_ts]
-        if not ready:
-            return None
-        self._queues[topic] = [(ts, prio, idx, msg) for ts, prio, idx, msg in queue if ts > now_ts]
+        queue = self._queues.get(topic, [] if self._manager is None else self._manager.list())
+        with self._locks[topic]:
+            ready = [(ts, prio, idx, msg) for ts, prio, idx, msg in queue if ts <= now_ts]
+            if not ready:
+                return None
+            remaining = [(ts, prio, idx, msg) for ts, prio, idx, msg in queue if ts > now_ts]
+            if isinstance(queue, list):
+                queue[:] = remaining
+            else:
+                queue[:] = remaining
         ready.sort(key=lambda t: (t[0], t[1], t[2]))
         _, _, _, latest = ready[-1]
         age = now_ts - latest.timestamp if hasattr(latest, "timestamp") else 0.0
         if age > max_age:
-            self.metrics[topic]["expired"] += 1
+            self.metrics[topic]["expired"] = self.metrics[topic]["expired"] + 1
             return None
         deadline_s = cfg.get("deadline_s", max_age)
         if now_ts - ready[-1][0] > deadline_s:
-            self.metrics[topic]["deadline_miss"] += 1
-        self.metrics[topic]["delivered"] += 1
+            self.metrics[topic]["deadline_miss"] = self.metrics[topic]["deadline_miss"] + 1
+        self.metrics[topic]["delivered"] = self.metrics[topic]["delivered"] + 1
         return latest
+
+
+@dataclass
+class PerceptionJob:
+    bgr: Any
+    depth_m: Any
+    depth_stereo_m: Any
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    sim_time: float
+    sensor_timestamp: Optional[float]
+    v: float
+    mu: float
+    log_both: bool
+    csv_writer: Any = None
+    tele_bgr: Any = None
+    tele_depth_m: Any = None
+
+
+@dataclass
+class PlanningJob:
+    trigger_name: Optional[str]
+    nearest_s_active: Optional[float]
+    nearest_thr: Optional[float]
+    tl_state: str
+    tl_s_active: Optional[float]
+    v: float
+    v_target: float
+    mu: float
+    ema_loop_ms: float
+    tracked_distance_for_control: float
+    stop_armed: bool
+    stop_latch_time: float
+    stop_release_ignore_until: float
+    red_green_since: float
+    no_trigger_elapsed: float
+    no_red_elapsed: float
+    depth_m: Any
+    depth_stereo_m: Any
+    nearest_box: Any
+    nearest_conf: Optional[float]
+    I_err: float
+    v_prev: float
+
+
+@dataclass
+class ActuationJob:
+    brake_cmd: float
+    v_ego: float
+    wheel_speeds: Any
+    a_long: float
+
+
+class ECUProcessNode:
+    """Small worker process wrapper to host an ECU in a separate process."""
+
+    def __init__(
+        self,
+        name: str,
+        handler: Callable[[Any], Any],
+        request_queue: mp.Queue,
+        response_queue: mp.Queue,
+        stop_event: mp.Event,
+    ):
+        self.name = name
+        self.handler = handler
+        self.request_queue = request_queue
+        self.response_queue = response_queue
+        self.stop_event = stop_event
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                payload = self.request_queue.get(timeout=0.05)
+            except queue_mod.Empty:
+                continue
+            if payload is None:
+                break
+            try:
+                result = self.handler(payload)
+                self.response_queue.put(result)
+            except Exception as exc:
+                self.response_queue.put(exc)
+
+
+class DistributedECUPipeline:
+    """Spawns separate OS processes for perception, planning, and actuation."""
+
+    def __init__(
+        self,
+        perception_handler: Callable[[PerceptionJob], PerceptionSignal],
+        planning_handler: Callable[[PlanningJob], PlanningDecision],
+        actuation_handler: Callable[[ActuationJob], ActuationResult],
+    ):
+        self.stop_event = mp.Event()
+        self.perception_q: mp.Queue = mp.Queue(maxsize=2)
+        self.perception_out: mp.Queue = mp.Queue(maxsize=2)
+        self.planning_q: mp.Queue = mp.Queue(maxsize=2)
+        self.planning_out: mp.Queue = mp.Queue(maxsize=2)
+        self.actuation_q: mp.Queue = mp.Queue(maxsize=2)
+        self.actuation_out: mp.Queue = mp.Queue(maxsize=2)
+
+        self.perception_proc = mp.Process(
+            target=ECUProcessNode(
+                "perception",
+                perception_handler,
+                self.perception_q,
+                self.perception_out,
+                self.stop_event,
+            ).run,
+            daemon=True,
+        )
+        self.planning_proc = mp.Process(
+            target=ECUProcessNode(
+                "planning",
+                planning_handler,
+                self.planning_q,
+                self.planning_out,
+                self.stop_event,
+            ).run,
+            daemon=True,
+        )
+        self.actuation_proc = mp.Process(
+            target=ECUProcessNode(
+                "actuation",
+                actuation_handler,
+                self.actuation_q,
+                self.actuation_out,
+                self.stop_event,
+            ).run,
+            daemon=True,
+        )
+
+        self.perception_proc.start()
+        self.planning_proc.start()
+        self.actuation_proc.start()
+
+    def shutdown(self) -> None:
+        self.stop_event.set()
+        for q in (self.perception_q, self.planning_q, self.actuation_q):
+            try:
+                q.put_nowait(None)
+            except Exception:
+                pass
+        for proc in (self.perception_proc, self.planning_proc, self.actuation_proc):
+            try:
+                proc.join(timeout=1.0)
+            except Exception:
+                pass
+
+    def _request(self, q_in: mp.Queue, q_out: mp.Queue, payload: Any, timeout: float) -> Any:
+        q_in.put(payload)
+        try:
+            return q_out.get(timeout=timeout)
+        except queue_mod.Empty:
+            raise TimeoutError("ECU process did not respond in time")
+
+    def run_perception(self, job: PerceptionJob, timeout: float = 0.5) -> PerceptionSignal:
+        result = self._request(self.perception_q, self.perception_out, job, timeout)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def run_planning(self, job: PlanningJob, timeout: float = 0.5) -> PlanningDecision:
+        result = self._request(self.planning_q, self.planning_out, job, timeout)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def run_actuation(self, job: ActuationJob, timeout: float = 0.5) -> ActuationResult:
+        result = self._request(self.actuation_q, self.actuation_out, job, timeout)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class SafetyMode(str, Enum):
