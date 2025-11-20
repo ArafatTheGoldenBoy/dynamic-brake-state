@@ -21,6 +21,7 @@ from ecu import (
     PlanningDecision,
     SafetyManager,
     ActuationResult,
+    SafetyManager,
 )
 from abs_system import AdaptivePISlipABSActuator, PISlipABSActuator
 from tracking_system import LeadMultiObjectTracker
