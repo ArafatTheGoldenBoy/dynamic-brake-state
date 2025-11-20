@@ -28,6 +28,7 @@ STEREO_ROI_SHRINK_DEFAULT = 0.35
 LANE_HALF_WIDTH = 1.8
 LATERAL_MARGIN = 0.6
 LATERAL_MAX = LANE_HALF_WIDTH + LATERAL_MARGIN
+H_MIN_PX = 12                     # minimum detection height to consider (pixels)
 
 # Cruise / braking
 A_MAX = 8.0                      # hard cap
