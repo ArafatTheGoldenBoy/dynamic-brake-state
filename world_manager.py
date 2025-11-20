@@ -185,9 +185,10 @@ class WorldManager:
 
     def tick(self, block: bool = True):
         if block:
-            self.world.tick()
+            return self.world.tick()
         else:
-            self.world.wait_for_tick()
+            snap = self.world.wait_for_tick()
+            return getattr(snap, 'frame', snap)
 
     def destroy(self):
         try:

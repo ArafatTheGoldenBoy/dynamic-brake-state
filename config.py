@@ -16,6 +16,25 @@ TL_STATE_SMOOTHING_FRAMES = 5
 DT = 0.02                        # 50 Hz (set 0.02 for lower latency)
 FX = (IMG_W / 2.0) / math.tan(math.radians(FOV_X_DEG / 2.0))
 
+# Pinhole range estimation + gating defaults
+OBJ_HEIGHT_M = {
+    'person': 1.7,
+    'bicycle': 1.6,
+    'car': 1.5,
+    'motorcycle': 1.4,
+    'motorbike': 1.4,
+    'bus': 3.1,
+    'truck': 3.0,
+    'train': 3.5,
+    'traffic light': 0.4,
+    'trafficlight': 0.4,
+    'stop sign': 0.75,
+    'stopsign': 0.75,
+}
+CENTER_BAND_FRAC = 0.35
+VEHICLE_CLASSES = {'car', 'truck', 'bus', 'train', 'motorcycle', 'motorbike', 'bicycle'}
+PEDESTRIAN_CLASSES = {'person'}
+
 # Stereo camera baseline (meters)
 STEREO_BASELINE_M = 0.54
 STEREO_FUSE_NEAR_WEIGHT = 0.65

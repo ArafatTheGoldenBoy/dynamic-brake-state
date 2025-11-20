@@ -1676,6 +1676,9 @@ class App:
                 except Exception as e:
                     shutdown_reason = f'world.tick failed: {e}'
                     raise
+                if frame_id is None:
+                    shutdown_reason = 'world.tick returned None'
+                    break
                 sim_time += DT
                 self._sim_time = sim_time
                 tic = time.time()
@@ -1852,18 +1855,25 @@ class App:
                     red_green_since = -1.0
 
                 tracker_state = None
-                tracker_active_states: List[Dict[str, Any]] = []
                 tracked_distance_for_control = None
                 tracked_rate = None
+                lead_track_id = None
+                lead_track_count = 0
                 tracker = getattr(self, '_lead_tracker', None)
                 if tracker is not None:
                     obstacle_measurements = perc.get('obstacle_measurements', [])
-                    tracker_state, tracker_active_states = tracker.step(sim_time, obstacle_measurements)
+                    measurement = None
+                    if obstacle_measurements:
+                        measurement = min(
+                            obstacle_measurements,
+                            key=lambda m: m.get('distance', float('inf')),
+                        )
+                    tracker_state = tracker.step(sim_time, measurement)
                     if tracker_state is not None:
                         tracked_distance_for_control = tracker_state.get('distance')
                         tracked_rate = tracker_state.get('rate')
-                lead_track_id = tracker_state.get('track_id') if tracker_state is not None else None
-                lead_track_count = len(tracker_active_states)
+                        lead_track_id = tracker_state.get('id')
+                        lead_track_count = tracker_state.get('tracker_count', 0)
                 if tracked_distance_for_control is None:
                     if nearest_s_active is not None:
                         tracked_distance_for_control = nearest_s_active
