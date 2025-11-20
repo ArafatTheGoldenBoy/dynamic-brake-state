@@ -1,7 +1,8 @@
 from __future__ import print_function
-import os, sys, math, argparse, random, queue, glob
-import time
+import os, sys, math, argparse, random, queue, glob, csv
+import time, traceback
 from typing import Optional, Tuple, List, Dict, Any
+from collections import deque, Counter
 
 import numpy as np
 import pygame
@@ -37,8 +38,19 @@ except Exception:
 import torch 
 
 # ===================== configuration =====================
-IMG_W, IMG_H      = 960, 540          # each pane (front + top)
+IMG_W, IMG_H      = 960, 540          # display pane size for primary/telephoto views
 FOV_X_DEG         = 90.0              # front cam horizontal FOV
+TELEPHOTO_IMG_W   = 640
+TELEPHOTO_IMG_H   = 360
+TELEPHOTO_FOV_X_DEG = 25.0
+TELEPHOTO_STRIDE_DEFAULT = 3
+TELEPHOTO_CACHE_MAX_AGE_S = 0.6
+TELEPHOTO_DIGITAL_ZOOM_DEFAULT = 1.5
+TELEPHOTO_DIGITAL_ZOOM_MAX = 3.5
+TELEPHOTO_ZOOM_TOP_BIAS = 0.35
+TL_PRIMARY_CROP_FRAC = 0.20
+TL_PRIMARY_SHORT_RANGE_M = 50.0
+TL_STATE_SMOOTHING_FRAMES = 5
 DT                = 0.02              # 50 Hz (set 0.02 for lower latency)
 FX                = (IMG_W / 2.0) / math.tan(math.radians(FOV_X_DEG / 2.0))
 
@@ -61,6 +73,18 @@ S_ENGAGE          = 80.0              # generic engage for vehicles/unknown
 S_ENGAGE_TL       = 55.0              # traffic‑light engage distance (red)
 S_ENGAGE_PED      = 45.0              # pedestrian engage distance
 V_STOP            = 0.10
+V_AEB_MIN_DEFAULT = 2.5               # minimum speed for obstacle-triggered AEB
+GATE_CONFIRM_FRAMES_DEFAULT = 3       # frames of gate_hit before AEB entry
+TTC_CONFIRM_S_DEFAULT = 2.5           # TTC threshold for obstacle confirmation
+TTC_STAGE_STRONG_DEFAULT = 1.8        # TTC where controller escalates to strong braking
+TTC_STAGE_FULL_DEFAULT   = 1.0        # TTC where controller escalates to full AEB
+
+# Multi-stage AEB shaping (fraction of μg cap)
+BRAKE_STAGE_COMFORT_FACTOR = 0.45
+BRAKE_STAGE_STRONG_FACTOR  = 0.75
+BRAKE_STAGE_FULL_FACTOR    = 1.00
+AEB_RAMP_UP_DEFAULT        = 12.0     # max increase in a_des (m/s^2) per second
+AEB_RAMP_DOWN_DEFAULT      = 18.0     # max decrease in a_des (m/s^2) per second
 
 # Clear timers (per reason)
 CLEAR_DELAY_OBS   = 0.9               # obstacle clear debounce
@@ -104,6 +128,11 @@ FRICTION_CONFIGS = {
 # False-stop heuristics for telemetry/episode labeling
 FALSE_STOP_MARGIN_M = 5.0      # if actual gap exceeds safety distance by this margin while braking → suspicious
 FALSE_STOP_TTC_S    = 4.0      # TTC above this while brake engaged → likely false stop
+
+# Actuation-latency measurement thresholds
+ACTUATION_BRAKE_CMD_MIN   = 0.18   # require brake command above this before timing
+ACTUATION_DECEL_THRESH    = 0.8    # m/s^2 decel magnitude that counts as "brake is biting"
+ACTUATION_TIMEOUT_S       = 1.5    # give up if no response within this horizon
 
 
 def compute_slip_per_wheel(v_ego: float, wheel_speeds: List[float]) -> List[float]:
@@ -280,6 +309,267 @@ class AdaptivePISlipABSActuator(PISlipABSActuator):
             'mu_est': self.friction.mu_est,
             'regime': self.current_regime,
         }
+
+
+class LeadKalmanTracker:
+    """Single-target constant-velocity Kalman filter for lead obstacle distance."""
+
+    def __init__(self, dt: float,
+                 process_var: float = 8.0,
+                 meas_var: float = 4.0,
+                 max_miss_s: float = 0.6,
+                 reset_jump_m: float = 12.0,
+                 min_iou_keep: float = 0.15):
+        self.dt = dt
+        self.process_var = process_var
+        self.meas_var = meas_var
+        self.max_miss_s = max(0.0, max_miss_s)
+        self.reset_jump_m = reset_jump_m
+        self.min_iou_keep = min_iou_keep
+        self.reset()
+
+    def reset(self):
+        self.active = False
+        self.x = np.zeros((2, 1), dtype=float)
+        self.P = np.eye(2, dtype=float)
+        self.box: Optional[Tuple[int, int, int, int]] = None
+        self.kind: Optional[str] = None
+        self.state_time: Optional[float] = None
+        self.last_meas_time: Optional[float] = None
+
+    def deactivate(self):
+        self.reset()
+
+    def _predict_to(self, target_time: Optional[float]):
+        if not self.active:
+            self.state_time = target_time
+            return
+        if target_time is None:
+            return
+        if self.state_time is None:
+            self.state_time = target_time
+            return
+        dt = float(target_time) - float(self.state_time)
+        if not math.isfinite(dt):
+            return
+        if dt < 0.0:
+            self.state_time = target_time
+            return
+        if dt < 1e-6:
+            self.state_time = target_time
+            return
+        F = np.array([[1.0, dt], [0.0, 1.0]])
+        q = self.process_var
+        Q = np.array([[0.25 * dt**4, 0.5 * dt**3],
+                      [0.5 * dt**3, dt**2]], dtype=float) * q
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + Q
+        self.state_time = target_time
+
+    def _kalman_update(self, z: float):
+        H = np.array([[1.0, 0.0]])
+        R = np.array([[self.meas_var]])
+        z_vec = np.array([[z]])
+        y = z_vec - H @ self.x
+        S = H @ self.P @ H.T + R
+        if S.shape == (1, 1):
+            inv_S = 1.0 / float(S[0, 0]) if S[0, 0] != 0 else 0.0
+        else:
+            inv_S = np.linalg.pinv(S)
+        K = self.P @ H.T * inv_S
+        self.x = self.x + K @ y
+        I = np.eye(self.P.shape[0])
+        self.P = (I - K @ H) @ self.P
+
+    def step(self, sim_time: float,
+             measurement: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+        if measurement is not None:
+            dist = measurement.get('distance')
+            if dist is not None and math.isfinite(dist):
+                dist = float(dist)
+                meas_ts = measurement.get('timestamp')
+                if meas_ts is None or not math.isfinite(meas_ts):
+                    meas_ts = sim_time
+                box = measurement.get('box')
+                kind = measurement.get('kind')
+                if not self.active:
+                    self.active = True
+                    self.x = np.array([[dist], [0.0]], dtype=float)
+                    self.P = np.eye(2, dtype=float) * 5.0
+                    self.box = box
+                    self.kind = kind
+                    self.state_time = meas_ts
+                    self.last_meas_time = meas_ts
+                else:
+                    self._predict_to(meas_ts)
+                    pred_dist = float(self.x[0, 0])
+                    same_kind = (self.kind is None or kind is None or self.kind == kind)
+                    overlap = iou_xywh(self.box, box) if (self.box is not None and box is not None) else 0.0
+                    if (abs(dist - pred_dist) > self.reset_jump_m and overlap < self.min_iou_keep) or (not same_kind and overlap < self.min_iou_keep):
+                        self.x = np.array([[dist], [0.0]], dtype=float)
+                        self.P = np.eye(2, dtype=float) * 5.0
+                        self.box = box
+                        self.kind = kind
+                        self.state_time = meas_ts
+                        self.last_meas_time = meas_ts
+                    else:
+                        self._kalman_update(dist)
+                        self.box = box if box is not None else self.box
+                        self.kind = kind if kind is not None else self.kind
+                        self.last_meas_time = meas_ts
+                        self.state_time = meas_ts
+        if not self.active:
+            return None
+        if (self.last_meas_time is not None) and ((sim_time - self.last_meas_time) > self.max_miss_s):
+            self.reset()
+            return None
+        self._predict_to(sim_time)
+        if (self.last_meas_time is not None) and ((sim_time - self.last_meas_time) > self.max_miss_s):
+            self.reset()
+            return None
+        return {
+            'distance': float(self.x[0, 0]),
+            'rate': float(self.x[1, 0]),
+            'age': None if self.last_meas_time is None else float(sim_time - self.last_meas_time),
+        }
+
+
+class LeadMultiObjectTracker:
+    """Maintain multiple Kalman tracks with ID assignments for lead selection."""
+
+    def __init__(self, dt: float,
+                 max_tracks: int = 4,
+                 assoc_iou_min: float = 0.2,
+                 tracker_kwargs: Optional[Dict[str, Any]] = None):
+        self.dt = dt
+        self.max_tracks = max(1, int(max_tracks))
+        self.assoc_iou_min = max(0.0, float(assoc_iou_min))
+        self._tracker_kwargs = tracker_kwargs or {}
+        self._tracks: Dict[int, LeadKalmanTracker] = {}
+        self._track_meta: Dict[int, Dict[str, Any]] = {}
+        self._next_id = 1
+
+    def reset(self):
+        for tracker in self._tracks.values():
+            tracker.reset()
+        self._tracks.clear()
+        self._track_meta.clear()
+        self._next_id = 1
+
+    def deactivate(self):
+        self.reset()
+
+    def _new_tracker(self) -> LeadKalmanTracker:
+        return LeadKalmanTracker(dt=self.dt, **self._tracker_kwargs)
+
+    def _assoc_score(self, track_id: int, measurement: Dict[str, Any]) -> float:
+        tracker = self._tracks.get(track_id)
+        if tracker is None:
+            return 0.0
+        overlap = iou_xywh(getattr(tracker, 'box', None), measurement.get('box'))
+        if overlap < self.assoc_iou_min:
+            return 0.0
+        score = overlap
+        kind = measurement.get('kind')
+        if tracker.kind is not None and kind is not None and tracker.kind == kind:
+            score += 0.2
+        dist = measurement.get('distance')
+        if dist is not None and tracker.active:
+            try:
+                pred = float(tracker.x[0, 0])
+                score += max(0.0, 1.0 - abs(pred - float(dist)) / max(1.0, float(dist)))
+            except Exception:
+                pass
+        return score
+
+    def _ensure_capacity(self):
+        if len(self._tracks) < self.max_tracks:
+            return
+        if not self._tracks:
+            return
+        far_id = None
+        far_dist = -1.0
+        for tid, tracker in self._tracks.items():
+            try:
+                dist = float(tracker.x[0, 0])
+            except Exception:
+                dist = 1e9
+            if dist > far_dist:
+                far_dist = dist
+                far_id = tid
+        if far_id is not None:
+            self._tracks.pop(far_id, None)
+            self._track_meta.pop(far_id, None)
+
+    def step(self, sim_time: float, measurements: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        measurements_sorted = sorted(measurements or [], key=lambda m: m.get('distance', 1e9))
+        assignments: Dict[int, Dict[str, Any]] = {}
+        unmatched: List[Dict[str, Any]] = []
+        for meas in measurements_sorted:
+            best_track = None
+            best_score = 0.0
+            for track_id in self._tracks.keys():
+                if track_id in assignments:
+                    continue
+                score = self._assoc_score(track_id, meas)
+                if score > best_score:
+                    best_score = score
+                    best_track = track_id
+            if best_track is not None:
+                assignments[best_track] = meas
+            else:
+                unmatched.append(meas)
+
+        active_states: List[Dict[str, Any]] = []
+        to_remove: List[int] = []
+        for track_id, tracker in list(self._tracks.items()):
+            meas = assignments.get(track_id)
+            state = tracker.step(sim_time, meas)
+            if state is None:
+                if not tracker.active:
+                    to_remove.append(track_id)
+                continue
+            meta = self._track_meta.setdefault(track_id, {})
+            meta['kind'] = tracker.kind
+            meta['box'] = tracker.box
+            active_states.append({
+                'track_id': track_id,
+                'distance': state.get('distance'),
+                'rate': state.get('rate'),
+                'age': state.get('age'),
+                'kind': tracker.kind,
+                'box': tracker.box,
+            })
+        for tid in to_remove:
+            self._tracks.pop(tid, None)
+            self._track_meta.pop(tid, None)
+
+        for meas in unmatched:
+            self._ensure_capacity()
+            tracker = self._new_tracker()
+            state = tracker.step(sim_time, meas)
+            if state is None:
+                continue
+            track_id = self._next_id
+            self._next_id += 1
+            self._tracks[track_id] = tracker
+            self._track_meta[track_id] = {'kind': tracker.kind, 'box': tracker.box}
+            active_states.append({
+                'track_id': track_id,
+                'distance': state.get('distance'),
+                'rate': state.get('rate'),
+                'age': state.get('age'),
+                'kind': tracker.kind,
+                'box': tracker.box,
+            })
+
+        active_states.sort(key=lambda s: (float('inf') if s.get('distance') is None else float(s['distance'])))
+        best_state = active_states[0] if active_states else None
+        return best_state, active_states
+
+    def active_track_count(self) -> int:
+        return len(self._tracks)
+
 
 # Detection (YOLO specific)
 YOLO_MODEL_PATH   = 'yolo12n.pt'     # path to YOLO12n weights
@@ -576,10 +866,12 @@ def estimate_tl_color_from_roi(bgr: np.ndarray, box: Tuple[int,int,int,int]) -> 
     x,y,w,h = box
     if w <= 0 or h <= 0:
         return 'UNKNOWN'
-    roi = bgr[max(0,y):min(IMG_H,y+h), max(0,x):min(IMG_W,x+w)]
+    h_lim, w_lim = bgr.shape[0], bgr.shape[1]
+    roi = bgr[max(0,y):min(h_lim,y+h), max(0,x):min(w_lim,x+w)]
     if roi.size == 0:
         return 'UNKNOWN'
-    thirds = [(0, int(h/3)), (int(h/3), int(2*h/3)), (int(2*h/3), h)]
+    roi_h = roi.shape[0]
+    thirds = [(0, int(roi_h/3)), (int(roi_h/3), int(2*roi_h/3)), (int(2*roi_h/3), roi_h)]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     means = []
     for (y0,y1) in thirds:
@@ -619,6 +911,52 @@ def estimate_tl_color_from_roi(bgr: np.ndarray, box: Tuple[int,int,int,int]) -> 
             if g_frac > 0.35:
                 return 'GREEN'
     return 'UNKNOWN'
+
+
+def apply_digital_zoom(image: np.ndarray, zoom: float,
+                       top_bias: float = TELEPHOTO_ZOOM_TOP_BIAS) -> Tuple[np.ndarray, Optional[Dict[str, Any]]]:
+    """Crop/resize the upper-center region of an image to emulate extra zoom."""
+    if image is None:
+        return image, None
+    zoom = max(1.0, float(zoom))
+    if zoom <= 1.0 + 1e-3:
+        return image, None
+    h, w = image.shape[:2]
+    crop_w = max(4, min(w, int(round(w / zoom))))
+    crop_h = max(4, min(h, int(round(h / zoom))))
+    x0 = max(0, (w - crop_w) // 2)
+    bias = max(0.0, min(1.0, float(top_bias)))
+    y0 = max(0, min(h - crop_h, int(round((h - crop_h) * bias))))
+    crop = image[y0:y0 + crop_h, x0:x0 + crop_w]
+    resized = cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR)
+    meta = {
+        'crop': (x0, y0, crop_w, crop_h),
+        'scale_x': crop_w / float(w),
+        'scale_y': crop_h / float(h),
+    }
+    return resized, meta
+
+
+def remap_zoom_box(box: Tuple[int, int, int, int], meta: Optional[Dict[str, Any]],
+                   full_w: int, full_h: int) -> Tuple[int, int, int, int]:
+    """Convert a bounding box from zoomed coordinates back to original space."""
+    if not meta:
+        return box
+    x0, y0, crop_w, crop_h = meta['crop']
+    scale_x = meta['scale_x']
+    scale_y = meta['scale_y']
+    x1, y1, w, h = box
+    x1_full = int(round(x0 + x1 * scale_x))
+    y1_full = int(round(y0 + y1 * scale_y))
+    w_full = int(round(max(1, w * scale_x)))
+    h_full = int(round(max(1, h * scale_y)))
+    x1_full = max(0, min(full_w - 1, x1_full))
+    y1_full = max(0, min(full_h - 1, y1_full))
+    if x1_full + w_full > full_w:
+        w_full = max(1, full_w - x1_full)
+    if y1_full + h_full > full_h:
+        h_full = max(1, full_h - y1_full)
+    return x1_full, y1_full, w_full, h_full
 
 # ===================== data types =====================
 from dataclasses import dataclass
@@ -903,10 +1241,11 @@ class RangeEstimator:
 # ===================== World & Sensors ====================
 class SensorRig:
     def __init__(self, world: carla.World, vehicle: carla.Vehicle, range_est: str,
-                 enable_top: bool = True, enable_depth: bool = True):
+                 enable_depth: bool = True, enable_telephoto: bool = True):
         self.world = world
         self.vehicle = vehicle
         self.range_est = range_est
+        self.enable_telephoto = enable_telephoto
         bp_lib = world.get_blueprint_library()
 
         cam_bp = bp_lib.find('sensor.camera.rgb')
@@ -941,13 +1280,41 @@ class SensorRig:
         self.q_front: "queue.Queue[carla.Image]" = queue.Queue()
         self.cam_front.listen(self.q_front.put)
 
-        self.cam_top = None
-        self.q_top = None
-        if enable_top:
-            self.cam_top = world.spawn_actor(
-                cam_bp, carla.Transform(carla.Location(x=0.0, z=25.0), carla.Rotation(pitch=-90.0)), attach_to=vehicle)
-            self.q_top = queue.Queue()
-            self.cam_top.listen(self.q_top.put)
+        self.cam_tele = None
+        self.q_tele = None
+        self.cam_tele_depth = None
+        self.q_tele_depth = None
+        if enable_telephoto:
+            tele_bp = bp_lib.find('sensor.camera.rgb')
+            tele_bp.set_attribute('image_size_x', str(TELEPHOTO_IMG_W))
+            tele_bp.set_attribute('image_size_y', str(TELEPHOTO_IMG_H))
+            tele_bp.set_attribute('fov', str(TELEPHOTO_FOV_X_DEG))
+            tele_bp.set_attribute('fstop', '8.0')
+            tele_bp.set_attribute('focal_distance', '1000.0')
+            tele_bp.set_attribute('lens_circle_multiplier', '0.0')
+            tele_bp.set_attribute('lens_k', '0.0')
+            try:
+                if tele_bp.has_attribute('motion_blur_intensity'):
+                    tele_bp.set_attribute('motion_blur_intensity', '0.0')
+                if tele_bp.has_attribute('motion_blur_max_distortion'):
+                    tele_bp.set_attribute('motion_blur_max_distortion', '0.0')
+                if tele_bp.has_attribute('motion_blur_min_object_screen_size'):
+                    tele_bp.set_attribute('motion_blur_min_object_screen_size', '1.0')
+            except RuntimeError:
+                pass
+            tele_tf = carla.Transform(carla.Location(x=1.6, z=1.5))
+            self.cam_tele = world.spawn_actor(tele_bp, tele_tf, attach_to=vehicle)
+            self.q_tele = queue.Queue()
+            self.cam_tele.listen(self.q_tele.put)
+
+            if enable_depth:
+                tele_depth_bp = bp_lib.find('sensor.camera.depth')
+                tele_depth_bp.set_attribute('image_size_x', str(TELEPHOTO_IMG_W))
+                tele_depth_bp.set_attribute('image_size_y', str(TELEPHOTO_IMG_H))
+                tele_depth_bp.set_attribute('fov', str(TELEPHOTO_FOV_X_DEG))
+                self.cam_tele_depth = world.spawn_actor(tele_depth_bp, tele_tf, attach_to=vehicle)
+                self.q_tele_depth = queue.Queue()
+                self.cam_tele_depth.listen(self.q_tele_depth.put)
 
         depth_bp = bp_lib.find('sensor.camera.depth')
         depth_bp.set_attribute('image_size_x', str(IMG_W))
@@ -974,7 +1341,9 @@ class SensorRig:
             self.cam_stereo_left.listen(self.q_stereo_left.put)
             self.cam_stereo_right.listen(self.q_stereo_right.put)
 
-        self.actors = [a for a in [self.cam_front, self.cam_top, self.cam_depth, self.cam_stereo_left, self.cam_stereo_right] if a is not None]
+        self.actors = [a for a in [self.cam_front, self.cam_depth,
+                                   self.cam_stereo_left, self.cam_stereo_right,
+                                   self.cam_tele, self.cam_tele_depth] if a is not None]
 
     @staticmethod
     def _get_latest(q: "queue.Queue[Any]", timeout: float):
@@ -1018,22 +1387,26 @@ class SensorRig:
         out: Dict[str, Any] = {}
         if expected_frame is None:
             out['front'] = self._get_latest(self.q_front, timeout)
-            if self.q_top is not None:
-                out['top'] = self._get_latest(self.q_top, timeout)
             if self.q_depth is not None:
                 out['depth'] = self._get_latest(self.q_depth, timeout)
             if self.q_stereo_left is not None and self.q_stereo_right is not None:
                 out['stereo_left']  = self._get_latest(self.q_stereo_left, timeout)
                 out['stereo_right'] = self._get_latest(self.q_stereo_right, timeout)
+            if self.q_tele is not None:
+                out['tele_rgb'] = self._get_latest(self.q_tele, timeout)
+            if self.q_tele_depth is not None:
+                out['tele_depth'] = self._get_latest(self.q_tele_depth, timeout)
         else:
             out['front'] = self._get_for_frame(self.q_front, expected_frame, timeout)
-            if self.q_top is not None:
-                out['top'] = self._get_for_frame(self.q_top, expected_frame, timeout)
             if self.q_depth is not None:
                 out['depth'] = self._get_for_frame(self.q_depth, expected_frame, timeout)
             if self.q_stereo_left is not None and self.q_stereo_right is not None:
                 out['stereo_left']  = self._get_for_frame(self.q_stereo_left, expected_frame, timeout)
                 out['stereo_right'] = self._get_for_frame(self.q_stereo_right, expected_frame, timeout)
+            if self.q_tele is not None:
+                out['tele_rgb'] = self._get_for_frame(self.q_tele, expected_frame, timeout)
+            if self.q_tele_depth is not None:
+                out['tele_depth'] = self._get_for_frame(self.q_tele_depth, expected_frame, timeout)
         return out
 
     def destroy(self):
@@ -1408,17 +1781,31 @@ class _TelemetryLogger:
         self._w.writerow([
             't','v_mps','tau_dyn','D_safety_dyn','sigma_depth','a_des','brake',
             'lambda_max','abs_factor','mu_est','mu_regime',
-            'loop_ms','detect_ms','latency_ms','a_meas','x_rel_m','range_est_m',
-            'gate_hit','false_stop_flag'
+            'loop_ms','loop_ms_max','detect_ms','latency_ms','a_meas','x_rel_m','range_est_m',
+            'ttc_s','gate_hit','gate_confirmed','false_stop_flag','brake_stage','brake_stage_factor',
+            'tracker_s_m','tracker_rate_mps','lead_track_id','active_track_count',
+            'sensor_ts','control_ts','sensor_to_control_ms',
+            'actuation_ts','control_to_act_ms','sensor_to_act_ms'
         ])
 
     def maybe_log(self, t: float, v: float, tau_dyn: Optional[float], D_safety_dyn: Optional[float],
                   sigma_depth: Optional[float], a_des: Optional[float], brake: Optional[float],
                   lambda_max: Optional[float], abs_factor: Optional[float],
                   mu_est: Optional[float], mu_regime: Optional[str],
-                  loop_ms: Optional[float], detect_ms: Optional[float], latency_ms: Optional[float],
+                  loop_ms: Optional[float], loop_ms_max: Optional[float],
+                  detect_ms: Optional[float], latency_ms: Optional[float],
                   a_meas: Optional[float], x_rel_m: Optional[float], range_est_m: Optional[float],
-                  gate_hit: Optional[bool], false_stop_flag: Optional[bool]):
+                  ttc_s: Optional[float],
+                  gate_hit: Optional[bool], gate_confirmed: Optional[bool],
+                  false_stop_flag: Optional[bool],
+                  brake_stage: Optional[int], brake_stage_factor: Optional[float],
+                  tracker_s: Optional[float], tracker_rate: Optional[float],
+                  tracker_id: Optional[int], tracker_count: Optional[int],
+                  sensor_ts: Optional[float], control_ts: Optional[float],
+                  sensor_to_control_ms: Optional[float],
+                  actuation_ts: Optional[float],
+                  control_to_act_ms: Optional[float],
+                  sensor_to_act_ms: Optional[float]):
         if t - self._last_t >= self.period:
             self._last_t = t
             self._w.writerow([
@@ -1433,13 +1820,28 @@ class _TelemetryLogger:
                 (None if mu_est is None else float(mu_est)),
                 mu_regime,
                 (None if loop_ms is None else float(loop_ms)),
+                (None if loop_ms_max is None else float(loop_ms_max)),
                 (None if detect_ms is None else float(detect_ms)),
                 (None if latency_ms is None else float(latency_ms)),
                 (None if a_meas is None else float(a_meas)),
                 (None if x_rel_m is None else float(x_rel_m)),
                 (None if range_est_m is None else float(range_est_m)),
+                (None if ttc_s is None else float(ttc_s)),
                 (None if gate_hit is None else int(bool(gate_hit))),
+                (None if gate_confirmed is None else int(bool(gate_confirmed))),
                 (None if false_stop_flag is None else int(bool(false_stop_flag))),
+                (None if brake_stage is None else int(brake_stage)),
+                (None if brake_stage_factor is None else float(brake_stage_factor)),
+                (None if tracker_s is None else float(tracker_s)),
+                (None if tracker_rate is None else float(tracker_rate)),
+                (None if tracker_id is None else int(tracker_id)),
+                (None if tracker_count is None else int(tracker_count)),
+                (None if sensor_ts is None else float(sensor_ts)),
+                (None if control_ts is None else float(control_ts)),
+                (None if sensor_to_control_ms is None else float(sensor_to_control_ms)),
+                (None if actuation_ts is None else float(actuation_ts)),
+                (None if control_to_act_ms is None else float(control_to_act_ms)),
+                (None if sensor_to_act_ms is None else float(sensor_to_act_ms)),
             ])
 
     def close(self):
@@ -1467,6 +1869,7 @@ class _ScenarioLogger:
             's_init_gt_m', 's_min_gt_m',
             'stopped', 't_to_stop_s', 'collision',
             'range_margin_m', 'tts_margin_s',
+            'ttc_init_s', 'ttc_min_s', 'reaction_time_s',
             'max_lambda', 'mean_abs_factor', 'false_stop'
         ])
         self._f.flush()
@@ -1476,6 +1879,8 @@ class _ScenarioLogger:
             s_init_gt: Optional[float], s_min_gt: Optional[float],
             stopped: bool, t_to_stop: float, collision: bool,
             range_margin: Optional[float], tts_margin: Optional[float],
+            ttc_init: Optional[float], ttc_min: Optional[float],
+            reaction_time: Optional[float],
             max_lambda: Optional[float], mean_abs_factor: Optional[float],
             false_stop: bool):
         self._w.writerow([
@@ -1492,6 +1897,9 @@ class _ScenarioLogger:
             bool(collision),
             (None if range_margin is None else float(range_margin)),
             (None if tts_margin is None else float(tts_margin)),
+            (None if ttc_init is None else float(ttc_init)),
+            (None if ttc_min is None else float(ttc_min)),
+            (None if reaction_time is None else float(reaction_time)),
             (None if max_lambda is None else float(max_lambda)),
             (None if mean_abs_factor is None else float(mean_abs_factor)),
             bool(false_stop),
@@ -1526,6 +1934,53 @@ class App:
                                       dnn=self.args.yolo_dnn,
                                       augment=self.args.yolo_augment,
                                       per_class_iou_map=parse_per_class_iou_map(self.args.yolo_class_iou))
+        self.telephoto_enabled = not getattr(self.args, 'no_telephoto', False)
+        try:
+            stride_raw = int(getattr(self.args, 'telephoto_stride', TELEPHOTO_STRIDE_DEFAULT))
+        except Exception:
+            stride_raw = TELEPHOTO_STRIDE_DEFAULT
+        self.telephoto_stride = max(2, stride_raw)
+        try:
+            zoom_raw = float(getattr(self.args, 'telephoto_zoom', TELEPHOTO_DIGITAL_ZOOM_DEFAULT))
+        except Exception:
+            zoom_raw = TELEPHOTO_DIGITAL_ZOOM_DEFAULT
+        self.telephoto_zoom = max(1.0, min(TELEPHOTO_DIGITAL_ZOOM_MAX, zoom_raw))
+        self.telephoto_intrinsics = intrinsics_from_fov(TELEPHOTO_IMG_W, TELEPHOTO_IMG_H, TELEPHOTO_FOV_X_DEG)
+        self._tl_state_history: deque = deque(maxlen=TL_STATE_SMOOTHING_FRAMES)
+        self._telephoto_compute_totals: Dict[str, Any] = {
+            'primary_calls': 0,
+            'primary_time_s': 0.0,
+            'telephoto_calls': 0,
+            'telephoto_time_s': 0.0,
+            'telephoto_invocations': 0,
+            'telephoto_frames_considered': 0,
+            'telephoto_skipped_disabled': 0,
+            'telephoto_skipped_stride': 0,
+            'telephoto_cache_hits': 0,
+        }
+        self.telephoto_compute_log_path = getattr(self.args, 'telephoto_compute_log', None)
+        self.telephoto_compute_fp = None
+        self.telephoto_compute_writer = None
+        if self.telephoto_compute_log_path:
+            try:
+                self.telephoto_compute_fp = open(self.telephoto_compute_log_path, 'w', newline='')
+                self.telephoto_compute_writer = csv.writer(self.telephoto_compute_fp)
+                self.telephoto_compute_writer.writerow([
+                    'timestamp', 'telephoto_enabled', 'telephoto_stride', 'telephoto_zoom',
+                    'primary_calls', 'primary_total_ms',
+                    'telephoto_invocations', 'telephoto_frames_considered',
+                    'telephoto_calls', 'telephoto_total_ms',
+                    'telephoto_cache_hits', 'telephoto_skipped_stride', 'telephoto_skipped_disabled',
+                    'with_telephoto_total_ms', 'without_telephoto_total_ms'
+                ])
+            except Exception as e:
+                print(f"[WARN] Failed to open telephoto compute log: {e}")
+                self.telephoto_compute_log_path = None
+                self.telephoto_compute_fp = None
+                self.telephoto_compute_writer = None
+        self._telephoto_last_candidate: Optional[Dict[str, Any]] = None
+        self._telephoto_last_time: float = -1.0
+        self._frame_index = 0
         self.class_conf_map = parse_per_class_conf_map(self.args.yolo_class_thr)
         self.engage_override_map = parse_engage_override_map(self.args.engage_override)
         self.min_h_map = parse_min_h_override_map(self.args.min_h_override)
@@ -1542,6 +1997,7 @@ class App:
             self.abs_actuator = PISlipABSActuator(dt=DT)
         else:
             self.abs_actuator = AdaptivePISlipABSActuator(dt=DT)
+        self._lead_tracker = LeadMultiObjectTracker(dt=DT)
         # Telemetry set up
         self.telemetry: Optional[_TelemetryLogger] = None
         if getattr(self.args, 'telemetry_csv', None):
@@ -1577,23 +2033,79 @@ class App:
         except Exception:
             self.stereo_roi_shrink = STEREO_ROI_SHRINK_DEFAULT
 
-    def _draw_hud(self, screen, bgr, img_top, perf_fps, perf_ms, x, y, z, yaw, compass,
+        # Decision-layer tuning knobs
+        try:
+            self.min_aeb_speed = max(0.0, float(getattr(self.args, 'min_aeb_speed', V_AEB_MIN_DEFAULT)))
+        except Exception:
+            self.min_aeb_speed = V_AEB_MIN_DEFAULT
+        try:
+            self.gate_confirm_frames = max(1, int(getattr(self.args, 'gate_confirm_frames', GATE_CONFIRM_FRAMES_DEFAULT)))
+        except Exception:
+            self.gate_confirm_frames = GATE_CONFIRM_FRAMES_DEFAULT
+        try:
+            self.ttc_confirm_s = max(0.5, float(getattr(self.args, 'ttc_confirm_s', TTC_CONFIRM_S_DEFAULT)))
+        except Exception:
+            self.ttc_confirm_s = TTC_CONFIRM_S_DEFAULT
+        try:
+            self.ttc_stage_strong = max(0.1, float(getattr(self.args, 'ttc_stage_strong', TTC_STAGE_STRONG_DEFAULT)))
+        except Exception:
+            self.ttc_stage_strong = TTC_STAGE_STRONG_DEFAULT
+        try:
+            self.ttc_stage_full = max(0.05, float(getattr(self.args, 'ttc_stage_full', TTC_STAGE_FULL_DEFAULT)))
+        except Exception:
+            self.ttc_stage_full = TTC_STAGE_FULL_DEFAULT
+        # Ensure ordering: full < strong <= confirm
+        if self.ttc_stage_strong <= self.ttc_stage_full:
+            self.ttc_stage_strong = self.ttc_stage_full + 0.05
+        self.ttc_stage_strong = min(self.ttc_confirm_s, self.ttc_stage_strong)
+        if self.ttc_stage_full >= self.ttc_stage_strong:
+            self.ttc_stage_full = max(0.1, self.ttc_stage_strong - 0.05)
+        try:
+            self.stage_factor_comfort = max(0.1, min(0.95, float(getattr(self.args, 'aeb_stage_comfort', BRAKE_STAGE_COMFORT_FACTOR))))
+        except Exception:
+            self.stage_factor_comfort = BRAKE_STAGE_COMFORT_FACTOR
+        try:
+            self.stage_factor_strong = max(self.stage_factor_comfort + 0.01,
+                                           min(0.99, float(getattr(self.args, 'aeb_stage_strong', BRAKE_STAGE_STRONG_FACTOR))))
+        except Exception:
+            self.stage_factor_strong = BRAKE_STAGE_STRONG_FACTOR
+        self.stage_factor_full = BRAKE_STAGE_FULL_FACTOR
+        try:
+            self.aeb_ramp_up = max(0.5, float(getattr(self.args, 'aeb_ramp_up', AEB_RAMP_UP_DEFAULT)))
+        except Exception:
+            self.aeb_ramp_up = AEB_RAMP_UP_DEFAULT
+        try:
+            self.aeb_ramp_down = max(0.5, float(getattr(self.args, 'aeb_ramp_down', AEB_RAMP_DOWN_DEFAULT)))
+        except Exception:
+            self.aeb_ramp_down = AEB_RAMP_DOWN_DEFAULT
+
+        self._gate_confirm_counter = 0
+        self._hazard_confirm_since = -1.0
+        self._aeb_a_des = 0.0
+
+    def _draw_hud(self, screen, bgr, perf_fps, perf_ms, x, y, z, yaw, compass,
                    frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
                    hold_reason, no_trigger_elapsed, no_red_elapsed, stop_armed,
                    stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
                    dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target,
                    collision_flag: bool,
+                   det_points: Optional[List[Dict[str, Any]]] = None,
+                   range_mode_label: Optional[str] = None,
                    abs_lambda: Optional[float] = None,
                    abs_factor: Optional[float] = None,
                    abs_mu: Optional[float] = None,
-                   abs_regime: Optional[str] = None):
+                   abs_regime: Optional[str] = None,
+                   tele_bgr: Optional[np.ndarray] = None):
         if self.headless:
             return
+        screen.fill((0, 0, 0))
         surf_front = bgr_to_pygame_surface(bgr)
         screen.blit(surf_front, (0, 0))
-        if img_top is not None and not getattr(self.args, 'no_top_cam', False):
-            surf_top = carla_image_to_surface(img_top)
-            screen.blit(surf_top,   (IMG_W, 0))
+        if tele_bgr is not None and self.telephoto_enabled:
+            if tele_bgr.shape[0] != IMG_H or tele_bgr.shape[1] != IMG_W:
+                tele_bgr = cv2.resize(tele_bgr, (IMG_W, IMG_H))
+            surf_tele = bgr_to_pygame_surface(tele_bgr)
+            screen.blit(surf_tele, (IMG_W, 0))
         v_kmh = v * 3.6
         txt0 = f'ego @ x={x:8.2f}  y={y:8.2f}  z={z:6.2f}  | yaw={yaw:+6.1f}° {compass}'
         txt1 = f'Frame {frame_id} | v={v_kmh:5.1f} km/h | trigger={trigger_name or "None"} | TL={tl_state}'
@@ -1603,8 +2115,16 @@ class App:
         shadow(screen, txt0, (10, IMG_H-134), (200,200,255))
         shadow(screen, txt1, (10, IMG_H-90), (255,255,255))
         shadow(screen, txt2, (10, IMG_H-68), (0,255,160))
-        if dbg_tau_dyn is not None:
-            shadow(screen, f'tau={dbg_tau_dyn:0.2f}  Dsafe={dbg_D_safety_dyn:0.1f} m  sigma={dbg_sigma_depth:0.2f} m  gate={int(dbg_gate_hit)}  a_des={dbg_a_des:0.2f}  brk={dbg_brake:0.2f}  Vtgt={v_target*3.6:0.0f}km/h',
+        if any(val is not None for val in (dbg_tau_dyn, dbg_D_safety_dyn, dbg_sigma_depth,
+                                           dbg_gate_hit, dbg_a_des, dbg_brake, v_target)):
+            tau_txt = 'n/a' if dbg_tau_dyn is None else f'{dbg_tau_dyn:0.2f}'
+            dsafe_txt = 'n/a' if dbg_D_safety_dyn is None else f'{dbg_D_safety_dyn:0.1f}'
+            sigma_txt = 'n/a' if dbg_sigma_depth is None else f'{dbg_sigma_depth:0.2f}'
+            gate_txt = 'n/a' if dbg_gate_hit is None else f'{int(bool(dbg_gate_hit))}'
+            a_des_txt = 'n/a' if dbg_a_des is None else f'{dbg_a_des:0.2f}'
+            brk_txt = 'n/a' if dbg_brake is None else f'{dbg_brake:0.2f}'
+            vtgt_txt = 'n/a' if v_target is None else f'{v_target*3.6:0.0f}'
+            shadow(screen, f'tau={tau_txt}  Dsafe={dsafe_txt} m  sigma={sigma_txt} m  gate={gate_txt}  a_des={a_des_txt}  brk={brk_txt}  Vtgt={vtgt_txt}km/h',
                    (10, IMG_H-24), (255,255,0))
         if abs_lambda is not None or abs_factor is not None or abs_mu is not None:
             slip_txt = 'n/a' if abs_lambda is None else f'{abs_lambda:.2f}'
@@ -1614,6 +2134,23 @@ class App:
             shadow(screen,
                    f'ABS slip={slip_txt}  f={fac_txt}  mu_est={mu_txt}  regime={regime_txt}',
                    (10, IMG_H-46), (180,255,255))
+        log_y = 10
+        log_x = 10
+        mode_label = range_mode_label or 'range'
+        shadow(screen, f'Ego→Object distances ({mode_label}, meters):', (log_x, log_y), (0, 255, 255))
+        log_y += 22
+        det_points_sorted: List[Dict[str, Any]] = []
+        if det_points:
+            det_points_sorted = sorted(det_points, key=lambda d: d.get('z', float('inf')))
+        if det_points_sorted:
+            for d in det_points_sorted[:22]:
+                xcam, ycam, zcam = d['xyz']
+                shadow(screen,
+                       f"{d['name']:<14}  Z={zcam:5.1f} m   X={xcam:+4.1f} m   Y={ycam:+4.1f} m",
+                       (log_x, log_y), (180, 255, 180))
+                log_y += 18
+        else:
+            shadow(screen, 'No detections', (log_x, log_y), (180, 180, 180))
         if collision_flag:
             shadow(screen, '*** COLLISION DETECTED ***', (IMG_W//4, IMG_H//2), (255,40,40))
         pygame.display.flip()
@@ -1696,8 +2233,9 @@ class App:
     # --- IO: read sensors and decode ---
     def _read_frames(self, frames: Dict[str, Any]) -> Dict[str, Any]:
         img_front = frames['front']
-        img_top   = frames.get('top', None)
         img_depth = frames.get('depth', None)
+        img_tele  = frames.get('tele_rgb', None)
+        img_tele_depth = frames.get('tele_depth', None)
 
         arr_front = np.frombuffer(img_front.raw_data, dtype=np.uint8).reshape((IMG_H, IMG_W, 4))
         bgr = arr_front[:, :, :3].copy()
@@ -1720,20 +2258,34 @@ class App:
             except Exception:
                 depth_stereo_m = None
 
+        tele_bgr = None
+        if img_tele is not None:
+            arr_tele = np.frombuffer(img_tele.raw_data, dtype=np.uint8).reshape((TELEPHOTO_IMG_H, TELEPHOTO_IMG_W, 4))
+            tele_bgr = arr_tele[:, :, :3].copy()
+        tele_depth_m = None
+        if img_tele_depth is not None:
+            tele_depth_bgra = np.frombuffer(img_tele_depth.raw_data, dtype=np.uint8).reshape((TELEPHOTO_IMG_H, TELEPHOTO_IMG_W, 4))
+            tele_depth_m = decode_depth_meters_from_bgra(tele_depth_bgra)
+
         return {
             'bgr': bgr,
-            'img_top': img_top,
             'depth_m': depth_m,
             'depth_stereo_m': depth_stereo_m,
+            'tele_bgr': tele_bgr,
+            'tele_depth_m': tele_depth_m,
         }
 
     # --- Perception: detection, distances, gating, TL/stop extraction ---
     def _perception_step(self, bgr: np.ndarray, depth_m: np.ndarray, depth_stereo_m: Optional[np.ndarray],
                          FX_: float, FY_: float, CX_: float, CY_: float,
-                         sim_time: float, v: float, MU: float,
-                         log_both: bool, csv_w) -> Dict[str, Any]:
+                         sim_time: float, sensor_timestamp: Optional[float], v: float, MU: float,
+                         log_both: bool, csv_w,
+                         tele_bgr: Optional[np.ndarray] = None,
+                         tele_depth_m: Optional[np.ndarray] = None) -> Dict[str, Any]:
         labels = self.detector.labels or {}
+        detect_t0 = time.perf_counter()
         classIds, confs, boxes = self.detector.predict_raw(bgr)
+        self._record_compute_time('primary', time.perf_counter() - detect_t0)
 
         nearest_s_active = None
         nearest_kind = None
@@ -1743,6 +2295,10 @@ class App:
         stop_detected_current = False
 
         tl_det_s, tl_det_box, tl_det_state = None, None, 'UNKNOWN'
+        tl_candidate_primary_near: Optional[Dict[str, Any]] = None
+        tl_candidate_primary_any: Optional[Dict[str, Any]] = None
+        tl_source = 'none'
+        obstacle_measurements: List[Dict[str, Any]] = []
 
         det_points: List[Dict[str, Any]] = []
         depth_cache_depth: Dict[Tuple[int,int,int,int], Optional[float]] = {}
@@ -1752,6 +2308,7 @@ class App:
         want_depth_samples = (self.args.range_est in ('depth', 'both', 'stereo')) or log_both or getattr(self, '_log_stereo_cmp', False)
         want_stereo_samples = ((self.args.range_est in ('stereo', 'both')) or getattr(self, '_log_stereo_cmp', False) or log_both) and (depth_stereo_m is not None)
 
+        primary_crop_top = int(TL_PRIMARY_CROP_FRAC * IMG_H)
         if len(classIds) != 0:
             cx0 = IMG_W/2.0
             for cid, conf, box in zip(np.array(classIds).flatten(), np.array(confs).flatten(), boxes):
@@ -1815,10 +2372,21 @@ class App:
                 if not lateral_ok:
                     continue
 
+                tl_state_roi = 'UNKNOWN'
                 if is_tl_like:
-                    tl_state_roi = estimate_tl_color_from_roi(bgr, (x1, y1, w, h))
-                    if (tl_det_s is None) or (s_use < tl_det_s):
-                        tl_det_s, tl_det_box, tl_det_state = s_use, (x1, y1, w, h), tl_state_roi
+                    if y2 <= primary_crop_top:
+                        continue
+                    y_tl = max(y1, primary_crop_top)
+                    h_tl = max(1, y2 - y_tl)
+                    tl_state_roi = estimate_tl_color_from_roi(bgr, (x1, y_tl, w, h_tl))
+                    if s_use is not None:
+                        cand = {'distance': float(s_use), 'box': (x1, y1, w, h),
+                                'state': tl_state_roi, 'source': 'primary'}
+                        if (tl_candidate_primary_any is None) or (cand['distance'] < tl_candidate_primary_any['distance']):
+                            tl_candidate_primary_any = cand
+                        if cand['distance'] <= TL_PRIMARY_SHORT_RANGE_M:
+                            if (tl_candidate_primary_near is None) or (cand['distance'] < tl_candidate_primary_near['distance']):
+                                tl_candidate_primary_near = cand
 
                 if (nearest_s_active is None) or (s_use < nearest_s_active):
                     nearest_s_active = s_use
@@ -1844,7 +2412,7 @@ class App:
                 color = (0,255,255)
                 if norm == 'stopsign': color = (0,0,255)
                 if is_tl_like:
-                    label = f'{name} {tl_det_state}'
+                    label = f'{name} {tl_state_roi}'
                 else:
                     label = f'{name}'
                 cv2.rectangle(bgr, (x1, y1), (x2, y2), color, 2)
@@ -1858,6 +2426,14 @@ class App:
 
                 if kind is not None and thr_for_kind is not None and nearest_thr is None:
                     nearest_thr = thr_for_kind
+                if kind is not None and kind != 'stop sign' and s_use is not None:
+                    obstacle_measurements.append({
+                        'distance': float(s_use),
+                        'box': (x1, y1, w, h),
+                        'kind': kind,
+                        'timestamp': sensor_timestamp if (sensor_timestamp is not None and math.isfinite(sensor_timestamp)) else sim_time,
+                        'confidence': float(conf),
+                    })
 
                 # HUD points (for distance overlay window)
                 u, v_ = x1 + w/2.0, y1 + h/2.0
@@ -1905,6 +2481,24 @@ class App:
                         stereo_val, depth_val, err_val, pin_val, v, MU
                     ])
 
+        tl_candidate = tl_candidate_primary_near
+        if tl_candidate is None:
+            tele_cand = self._maybe_run_telephoto_tl(tele_bgr, tele_depth_m, depth_roi, sim_time)
+            if tele_cand is not None:
+                tl_candidate = tele_cand
+        if tl_candidate is None and tl_candidate_primary_any is not None:
+            tl_candidate = tl_candidate_primary_any
+        if tl_candidate is not None:
+            tl_det_s = tl_candidate.get('distance')
+            tl_det_box = tl_candidate.get('box') if tl_candidate.get('source') == 'primary' else None
+            tl_det_state = tl_candidate.get('state', 'UNKNOWN')
+            tl_source = tl_candidate.get('source', 'primary')
+        else:
+            tl_det_s, tl_det_box, tl_det_state = None, None, 'UNKNOWN'
+            tl_source = 'none'
+
+        tl_det_state, tl_det_s = self._smooth_tl_state(tl_det_state, tl_det_s)
+
         # Merge with CARLA TL actor state
         tl_state_actor = 'UNKNOWN'
         try:
@@ -1929,8 +2523,150 @@ class App:
             'tl_state': tl_state,
             'tl_s_active': tl_det_s,
             'tl_det_box': tl_det_box,
+            'tl_source': tl_source,
             'stop_detected_current': stop_detected_current,
+            'obstacle_measurements': obstacle_measurements,
         }
+
+    def _smooth_tl_state(self, state: str, distance: Optional[float]) -> Tuple[str, Optional[float]]:
+        if not hasattr(self, '_tl_state_history') or self._tl_state_history.maxlen != TL_STATE_SMOOTHING_FRAMES:
+            self._tl_state_history = deque(maxlen=TL_STATE_SMOOTHING_FRAMES)
+        self._tl_state_history.append({'state': state, 'distance': distance})
+        votes = [entry for entry in self._tl_state_history if entry['state'] != 'UNKNOWN']
+        if votes:
+            counts = Counter(entry['state'] for entry in votes)
+            best_state, _ = counts.most_common(1)[0]
+            dists = [entry['distance'] for entry in votes if entry['state'] == best_state and entry['distance'] is not None]
+            best_dist = None
+            if dists:
+                best_dist = float(sum(dists) / len(dists))
+            elif distance is not None:
+                best_dist = distance
+            return best_state, best_dist
+        return state, distance
+
+    def _record_compute_time(self, scope: str, duration_s: float):
+        stats = getattr(self, '_telephoto_compute_totals', None)
+        if stats is None or duration_s is None:
+            return
+        if scope == 'primary':
+            stats['primary_calls'] += 1
+            stats['primary_time_s'] += max(0.0, float(duration_s))
+        elif scope == 'telephoto':
+            stats['telephoto_calls'] += 1
+            stats['telephoto_time_s'] += max(0.0, float(duration_s))
+
+    def _maybe_write_telephoto_compute_summary(self):
+        stats = getattr(self, '_telephoto_compute_totals', None)
+        if not stats:
+            return
+        primary_ms = stats.get('primary_time_s', 0.0) * 1000.0
+        telephoto_ms = stats.get('telephoto_time_s', 0.0) * 1000.0
+        with_ms = primary_ms + telephoto_ms
+        without_ms = primary_ms
+        if stats.get('primary_calls', 0) == 0 and stats.get('telephoto_invocations', 0) == 0:
+            return
+        try:
+            print(
+                f"[TELEPHOTO] compute totals | primary={primary_ms:.1f}ms (calls={stats.get('primary_calls', 0)}) "
+                f"telephoto={telephoto_ms:.1f}ms (runs={stats.get('telephoto_calls', 0)} stride_skips={stats.get('telephoto_skipped_stride', 0)}) "
+                f"with={with_ms:.1f}ms vs without={without_ms:.1f}ms"
+            )
+        except Exception:
+            pass
+        writer = getattr(self, 'telephoto_compute_writer', None)
+        fp = getattr(self, 'telephoto_compute_fp', None)
+        if writer is None or fp is None:
+            return
+        timestamp = time.time()
+        try:
+            writer.writerow([
+                f"{timestamp:.3f}",
+                bool(self.telephoto_enabled),
+                int(self.telephoto_stride),
+                float(self.telephoto_zoom),
+                stats.get('primary_calls', 0),
+                f"{primary_ms:.3f}",
+                stats.get('telephoto_invocations', 0),
+                stats.get('telephoto_frames_considered', 0),
+                stats.get('telephoto_calls', 0),
+                f"{telephoto_ms:.3f}",
+                stats.get('telephoto_cache_hits', 0),
+                stats.get('telephoto_skipped_stride', 0),
+                stats.get('telephoto_skipped_disabled', 0),
+                f"{with_ms:.3f}",
+                f"{without_ms:.3f}",
+            ])
+            fp.flush()
+        except Exception:
+            pass
+
+    def _maybe_run_telephoto_tl(self, tele_bgr: Optional[np.ndarray], tele_depth_m: Optional[np.ndarray],
+                                depth_roi: float, sim_time: float) -> Optional[Dict[str, Any]]:
+        stats = getattr(self, '_telephoto_compute_totals', None)
+        if stats is not None:
+            stats['telephoto_invocations'] += 1
+        if not self.telephoto_enabled or tele_bgr is None:
+            if stats is not None:
+                stats['telephoto_skipped_disabled'] += 1
+            return None
+        stride = max(2, int(self.telephoto_stride))
+        if stats is not None:
+            stats['telephoto_frames_considered'] += 1
+        frame_idx = getattr(self, '_frame_index', 0)
+        run_now = (frame_idx % stride) == 0
+        cached = getattr(self, '_telephoto_last_candidate', None)
+        if not run_now:
+            if stats is not None:
+                stats['telephoto_skipped_stride'] += 1
+            if cached is not None and (sim_time - float(self._telephoto_last_time)) <= TELEPHOTO_CACHE_MAX_AGE_S:
+                if stats is not None:
+                    stats['telephoto_cache_hits'] += 1
+                return cached
+            return None
+
+        infer_img = tele_bgr
+        zoom_meta = None
+        if self.telephoto_zoom > 1.0 + 1e-3:
+            infer_img, zoom_meta = apply_digital_zoom(tele_bgr, self.telephoto_zoom)
+        t0 = time.perf_counter()
+        classIds, confs, boxes = self.detector.predict_raw(infer_img)
+        self._record_compute_time('telephoto', time.perf_counter() - t0)
+        labels = self.detector.labels or {}
+        best: Optional[Dict[str, Any]] = None
+        _, fy_t, _, _ = self.telephoto_intrinsics
+        for cid, conf, box in zip(np.array(classIds).flatten(), np.array(confs).flatten(), boxes):
+            x1, y1, w, h = map(int, box)
+            name = labels.get(cid, str(cid))
+            norm = _norm_label(name)
+            if 'traffic' not in norm or 'light' not in norm:
+                continue
+            conf_req = self.class_conf_map.get(norm, self.detector.conf_thr)
+            if conf < conf_req:
+                continue
+            if h <= 0 or w <= 0:
+                continue
+            full_box = remap_zoom_box((x1, y1, w, h), zoom_meta, tele_bgr.shape[1], tele_bgr.shape[0])
+            x1_f, y1_f, w_f, h_f = full_box
+            if h_f <= 0 or w_f <= 0:
+                continue
+            H_real = OBJ_HEIGHT_M.get(name, OBJ_HEIGHT_M.get('traffic light'))
+            s_pinhole = (fy_t * float(H_real)) / float(h_f) if (H_real is not None and h_f > 0) else None
+            s_depth = None
+            if tele_depth_m is not None:
+                s_depth = median_depth_in_box(tele_depth_m, full_box, shrink=depth_roi)
+            s_use = s_depth if s_depth is not None else s_pinhole
+            if s_use is None or not math.isfinite(s_use):
+                continue
+            tl_state_roi = estimate_tl_color_from_roi(tele_bgr, full_box)
+            cand = {'distance': float(s_use), 'box': full_box,
+                    'state': tl_state_roi, 'source': 'telephoto'}
+            if best is None or cand['distance'] < best['distance']:
+                best = cand
+
+        self._telephoto_last_candidate = best
+        self._telephoto_last_time = sim_time
+        return best
 
     # --- Safety envelope: compute tau_dyn, D_safety_dyn, sigma_depth with smoothing ---
     def _safety_envelope(self, v: float, MU: float, ema_loop_ms: float,
@@ -1999,6 +2735,33 @@ class App:
             reason_red = True
             nearest_s_active = tl_s_active
 
+        # Pre-compute dynamic envelope + gate state if we have a candidate distance
+        s_used = None
+        tau_dyn = None
+        D_safety_dyn = None
+        sigma_depth = None
+        latency_s = None
+        required_dist_physics = None
+        gate_hit = False
+        tracked_rate = getattr(self, '_tracked_rate', None)
+        s_eff = None
+        if (nearest_s_active is not None) or (last_s0 is not None):
+            s_used = last_s0 if last_s0 is not None else nearest_s_active
+            tau_dyn, D_safety_dyn, sigma_depth, latency_s = self._safety_envelope(
+                v, MU, ema_loop_ms, nearest_box, nearest_conf, depth_m, depth_stereo_m)
+            required_dist_physics = (v*v)/(2.0*max(1e-3, A_MU)) + v*tau_dyn + D_safety_dyn
+            gate_hit = (required_dist_physics >= s_used)
+            if (tau_dyn is not None) and (D_safety_dyn is not None) and (s_used is not None):
+                s_eff = max(EPS, s_used - D_safety_dyn - v * tau_dyn)
+
+        ttc = None
+        if s_used is not None:
+            closing_speed = v
+            if tracked_rate is not None and math.isfinite(tracked_rate) and tracked_rate < -0.05:
+                closing_speed = max(0.1, -tracked_rate)
+            closing_speed = max(0.1, closing_speed)
+            ttc = s_used / closing_speed
+
         in_brake_band = reason_object or reason_stop or reason_red
 
         brake_reason = None
@@ -2026,33 +2789,77 @@ class App:
         if in_brake_band and trigger_name and ('stop sign' in trigger_name) and (stop_release_ignore_until >= 0) and (self._sim_time < stop_release_ignore_until):
             in_brake_band = False
 
-        dbg = {'tau_dyn': None, 'D_safety_dyn': None, 'sigma_depth': None, 'gate_hit': False,
-               'a_des': None, 'brake': None, 'brake_active': in_brake_band,
-               'brake_reason': brake_reason, 'brake_target_dist': nearest_s_active,
-               'latency_s': None}
-
-        if in_brake_band and (nearest_s_active is not None):
-            s_used = 0.7 * (last_s0 if last_s0 is not None else nearest_s_active) + 0.3 * nearest_s_active
-            tau_dyn, D_safety_dyn, sigma_depth, latency_s = self._safety_envelope(v, MU, ema_loop_ms, nearest_box, nearest_conf, depth_m, depth_stereo_m)
-            required_dist_physics = (v*v)/(2.0*max(1e-3, A_MU)) + v*tau_dyn + D_safety_dyn
-            gate_hit = (required_dist_physics >= s_used)
-
+        gate_confirmed = gate_hit
+        object_ready = reason_object
+        if reason_object:
             if gate_hit:
-                a_des = A_MU
-                brake_ff = min(1.0, a_des / A_MAX)
-                a_meas = 0.0 if v_prev is None else max(0.0, (v_prev - v) / DT)
-                e = max(0.0, a_des - a_meas)
-                I_err = max(-I_MAX, min(I_MAX, I_err + e*DT))
-                brake = max(0.0, min(1.0, brake_ff + (KPB*e + KIB*I_err)/A_MAX))
+                self._gate_confirm_counter = min(self._gate_confirm_counter + 1, self.gate_confirm_frames * 2)
             else:
-                s_eff = max(s_used - D_safety_dyn - v*tau_dyn, EPS)
-                a_des = min((v*v) / (2.0 * s_eff), A_MAX)
-                a_des = min(a_des, A_MU)
-                brake_ff = max(0.0, min(1.0, a_des / A_MAX))
-                a_meas = 0.0 if v_prev is None else max(0.0, (v_prev - v) / DT)
-                e = max(0.0, a_des - a_meas)
-                I_err = max(-I_MAX, min(I_MAX, I_err + e*DT))
-                brake = max(0.0, min(1.0, brake_ff + (KPB*e + KIB*I_err)/A_MAX))
+                self._gate_confirm_counter = max(0, self._gate_confirm_counter - 1)
+            gate_confirmed = self._gate_confirm_counter >= self.gate_confirm_frames
+            ttc_ok = (ttc is None) or (ttc <= self.ttc_confirm_s)
+            speed_ok = v >= self.min_aeb_speed
+            object_ready = gate_confirmed and ttc_ok and speed_ok
+        else:
+            self._gate_confirm_counter = 0
+            gate_confirmed = False
+            object_ready = False
+
+        in_brake_band = object_ready or reason_stop or reason_red
+
+        brake_stage = 0
+        stage_factor = 0.0
+        if in_brake_band:
+            if (ttc is None) or (ttc > self.ttc_stage_strong):
+                brake_stage = 1
+            if (ttc is not None) and (ttc <= self.ttc_stage_strong):
+                brake_stage = 2
+            if (ttc is not None) and (ttc <= self.ttc_stage_full):
+                brake_stage = 3
+            if reason_stop or reason_red:
+                brake_stage = max(1, brake_stage)
+            stage_map = {
+                1: self.stage_factor_comfort,
+                2: self.stage_factor_strong,
+                3: self.stage_factor_full,
+            }
+            stage_factor = stage_map.get(brake_stage, 0.0)
+
+        dbg_target = s_used if s_used is not None else nearest_s_active
+        dbg = {'tau_dyn': tau_dyn, 'D_safety_dyn': D_safety_dyn, 'sigma_depth': sigma_depth, 'gate_hit': gate_hit,
+               'a_des': None, 'brake': None, 'brake_active': in_brake_band,
+                'brake_reason': brake_reason, 'brake_target_dist': dbg_target,
+               'latency_s': latency_s, 'ttc': ttc, 'gate_confirmed': gate_confirmed,
+               'brake_stage': brake_stage, 'brake_stage_factor': stage_factor}
+
+        if in_brake_band and (s_used is not None) and (tau_dyn is not None) and (D_safety_dyn is not None):
+            a_candidate = None
+            if not gate_hit and s_eff is not None:
+                a_candidate = min(A_MAX, (v*v) / (2.0 * max(EPS, s_eff)))
+                a_candidate = min(a_candidate, A_MU)
+            if a_candidate is None:
+                a_candidate = A_MU if gate_hit else min(A_MU, A_MAX)
+            stage_limit = None
+            if brake_stage == 1:
+                stage_limit = self.stage_factor_comfort * A_MU
+            elif brake_stage == 2:
+                stage_limit = self.stage_factor_strong * A_MU
+            elif brake_stage >= 3:
+                stage_limit = self.stage_factor_full * A_MU
+            a_target = a_candidate if stage_limit is None else min(a_candidate, stage_limit)
+            prev_a = getattr(self, '_aeb_a_des', 0.0)
+            ramp_up = self.aeb_ramp_up * DT
+            ramp_down = self.aeb_ramp_down * DT
+            if a_target > prev_a:
+                a_des = min(a_target, prev_a + ramp_up)
+            else:
+                a_des = max(a_target, prev_a - ramp_down)
+            self._aeb_a_des = a_des
+            brake_ff = max(0.0, min(1.0, a_des / A_MAX))
+            a_meas = 0.0 if v_prev is None else max(0.0, (v_prev - v) / DT)
+            e = max(0.0, a_des - a_meas)
+            I_err = max(-I_MAX, min(I_MAX, I_err + e*DT))
+            brake = max(0.0, min(1.0, brake_ff + (KPB*e + KIB*I_err)/A_MAX))
 
             if v < V_STOP:
                 hold_blocked = True
@@ -2065,8 +2872,13 @@ class App:
 
             dbg.update({'tau_dyn': tau_dyn, 'D_safety_dyn': D_safety_dyn, 'sigma_depth': sigma_depth,
                         'gate_hit': gate_hit, 'a_des': a_des, 'brake': brake,
-                        'brake_reason': brake_reason, 'brake_target_dist': nearest_s_active,
+                        'brake_reason': brake_reason, 'brake_target_dist': s_used if s_used is not None else nearest_s_active,
                         'latency_s': latency_s,
+                        'ttc': ttc,
+                        'gate_confirmed': gate_confirmed,
+                        'brake_stage': brake_stage,
+                        'brake_stage_factor': stage_factor,
+                        'a_des_target': a_target,
                         'brake_active': True})
 
         elif hold_blocked:
@@ -2083,6 +2895,9 @@ class App:
 
             if release:
                 hold_blocked = False; hold_reason = None; last_s0 = None
+                if hasattr(self, '_lead_tracker') and self._lead_tracker is not None:
+                    self._lead_tracker.deactivate()
+                self._aeb_a_des = 0.0
                 throttle, brake = 0.0, 0.0
                 self._kick_until = self._sim_time + KICK_SEC
                 stop_release_ignore_until = self._sim_time + 2.0
@@ -2092,6 +2907,7 @@ class App:
             e_v = v_target - v
             throttle = max(0.0, min(1.0, KP_THROTTLE * e_v))
             brake = 0.0
+            self._aeb_a_des = 0.0
             if self._sim_time < getattr(self, '_kick_until', 0.0) and v < 0.3:
                 throttle = max(throttle, KICK_THR)
             if not hold_blocked and v < 0.25:
@@ -2128,20 +2944,10 @@ class App:
         pygame.init()
         self.screen = None
         if not self.headless:
-            win_cols = 2 if not getattr(self.args, 'no_top_cam', False) else 1
+            win_cols = 2 if self.telephoto_enabled else 1
             WIN_W, WIN_H = IMG_W * win_cols, IMG_H
             self.screen = pygame.display.set_mode((WIN_W, WIN_H))
             pygame.display.set_caption('Nearestfirst + TL/StopSign | YOLO12n | Sync (OOP)')
-        if not getattr(self.args, 'no_opencv', False) and not self.headless:
-            try:
-                cv2.namedWindow('DEPTH', cv2.WINDOW_NORMAL)
-                cv2.resizeWindow('DEPTH', IMG_W, IMG_H)
-                cv2.moveWindow('DEPTH', 960, 540)
-                cv2.namedWindow('HUD_DIST', cv2.WINDOW_NORMAL)
-                cv2.resizeWindow('HUD_DIST', IMG_W, IMG_H)
-                cv2.moveWindow('HUD_DIST', 0, 540)
-            except Exception:
-                pass
 
     def _close_windows(self):
         try:
@@ -2166,6 +2972,9 @@ class App:
 
         self._init_windows()
         clock = pygame.time.Clock()
+        shutdown_reason = 'running'
+        if hasattr(self, '_lead_tracker') and self._lead_tracker is not None:
+            self._lead_tracker.reset()
 
         self.world = WorldManager(
             self.args.host, self.args.port, self.args.town, self.args.mu, self.args.apply_tire_friction,
@@ -2183,9 +2992,8 @@ class App:
         # One-time startup summary for quick sanity check
         try:
             print(
-                f"Views: top={'ON' if not getattr(self.args, 'no_top_cam', False) else 'OFF'} "
-                f"depth={'ON' if not getattr(self.args, 'no_depth_cam', False) else 'OFF'} "
-                f"opencv={'ON' if not getattr(self.args, 'no_opencv', False) else 'OFF'}"
+                f"Views: telephoto={'ON' if self.telephoto_enabled else 'OFF'} "
+                f"depth={'ON' if not getattr(self.args, 'no_depth_cam', False) else 'OFF'}"
             )
             print(
                 f"NPCs: vehicles={getattr(self.args, 'npc_vehicles', 0)} walkers={getattr(self.args, 'npc_walkers', 0)} "
@@ -2221,8 +3029,8 @@ class App:
             self._log_stereo_cmp = True
             self._stereo_csv_w = stereo_csv_w
         self.sensors = SensorRig(self.world.world, self.world.ego, used_range,
-                                 enable_top=(not getattr(self.args, 'no_top_cam', False)),
-                                 enable_depth=(not getattr(self.args, 'no_depth_cam', False)))
+                                 enable_depth=(not getattr(self.args, 'no_depth_cam', False)),
+                                 enable_telephoto=self.telephoto_enabled)
         if self.args.range_est == 'stereo':
             self.range.ensure_stereo()
 
@@ -2234,15 +3042,17 @@ class App:
         dist_total = 0.0
         perf_ms = 0.0; perf_fps = 0.0; ema_loop_ms = DT * 1000.0
         v_prev = None; I_err = 0.0
-        gate_hit_ema = 0.0
+        loop_ms_max = 0.0
         sigma_depth_ema = 0.40
         sigma_depth_max_step = 0.50
         stop_persist_count = 0
         hold_blocked = False
         hold_reason   = None
         last_s0 = None
+        tracked_rate = None
         prev_loc = None
         sim_time = 0.0
+        sensor_timestamp = None
         kick_until = 0.0
         stop_latch_time = -1.0
         stop_armed = False
@@ -2262,6 +3072,13 @@ class App:
         dbg_a_des = None
         dbg_brake = None
 
+        # Latency measurement states
+        pending_actuation: Optional[Dict[str, float]] = None
+        last_actuation_ts: Optional[float] = None
+        last_control_to_act_ms: Optional[float] = None
+        last_sensor_to_act_ms: Optional[float] = None
+        prev_brake_cmd = 0.0
+
         # Braking episode tracking for scenario-level results
         episode_active = False
         episode_trigger = None
@@ -2275,27 +3092,45 @@ class App:
         episode_abs_factor_count = 0
         episode_false_flag = False
         episode_t_start = 0.0
+        episode_ttc_init = None
+        episode_ttc_min = None
+        episode_reaction_time = None
         if not hasattr(self, '_prev_brake_activation'):
             self._prev_brake_activation = False
         if not hasattr(self, '_collision_logged_count'):
             self._collision_logged_count = 0
         collision_event_time = getattr(self, '_collision_last_time', -1.0)
         collision_logged_count = getattr(self, '_collision_logged_count', 0)
+        self._gate_confirm_counter = 0
+        self._hazard_confirm_since = -1.0
 
         try:
             t0 = time.time()
             while True:
-                frame_id = self.world.tick()
+                try:
+                    frame_id = self.world.tick()
+                except Exception as e:
+                    shutdown_reason = f'world.tick failed: {e}'
+                    raise
                 sim_time += DT
                 self._sim_time = sim_time
                 tic = time.time()
 
-                frames = self.sensors.read(expected_frame=frame_id)
+                try:
+                    frames = self.sensors.read(expected_frame=frame_id)
+                except queue.Empty:
+                    shutdown_reason = 'sensor queue timeout (no new frames)'
+                    break
+                sensor_timestamp = None
+                front_frame = frames.get('front')
+                if front_frame is not None:
+                    sensor_timestamp = getattr(front_frame, 'timestamp', None)
                 io = self._read_frames(frames)
                 bgr = io['bgr']
-                img_top = io['img_top']
                 depth_m = io['depth_m']
                 depth_stereo_m = io['depth_stereo_m']
+                tele_bgr = io.get('tele_bgr')
+                tele_depth_m = io.get('tele_depth_m')
 
                 tr = self.world.ego.get_transform()
                 loc = tr.location; rot = tr.rotation
@@ -2316,16 +3151,29 @@ class App:
                 wheel_speeds = self._get_wheel_linear_speeds()
                 a_long = 0.0 if v_prev is None else (v - v_prev) / DT
 
-                if not getattr(self.args, 'no_opencv', False) and not self.headless:
-                    max_vis = 120.0
-                    vis = np.clip(depth_m / max_vis, 0.0, 1.0)
-                    vis8 = (vis * 255.0).astype(np.uint8)
-                    vis8 = cv2.applyColorMap(vis8, cv2.COLORMAP_PLASMA)
-                    cv2.imshow('DEPTH', vis8)
+                # Check if a pending actuation measurement can be resolved
+                if pending_actuation is not None:
+                    control_ts = pending_actuation.get('control_ts', sim_time)
+                    since_control = sim_time - float(control_ts)
+                    if since_control > ACTUATION_TIMEOUT_S:
+                        pending_actuation = None
+                    elif a_long <= -ACTUATION_DECEL_THRESH:
+                        last_actuation_ts = sim_time
+                        last_control_to_act_ms = max(0.0, since_control * 1000.0)
+                        sensor_ts_pending = pending_actuation.get('sensor_ts')
+                        if sensor_ts_pending is not None and math.isfinite(sensor_ts_pending):
+                            last_sensor_to_act_ms = max(0.0, (sim_time - float(sensor_ts_pending)) * 1000.0)
+                        else:
+                            last_sensor_to_act_ms = None
+                        pending_actuation = None
+
                 # Perception step (YOLO + depth/stereo + gating)
                 detect_ms = None
                 detect_t0 = time.time()
-                perc = self._perception_step(bgr, depth_m, depth_stereo_m, FX_, FY_, CX_, CY_, sim_time, v, MU, log_both, csv_w)
+                self._frame_index += 1
+                perc = self._perception_step(bgr, depth_m, depth_stereo_m, FX_, FY_, CX_, CY_,
+                                             sim_time, sensor_timestamp, v, MU, log_both, csv_w,
+                                             tele_bgr=tele_bgr, tele_depth_m=tele_depth_m)
                 detect_ms = (time.time() - detect_t0) * 1000.0
                 bgr = perc['bgr']
                 det_points = perc['det_points']
@@ -2366,25 +3214,6 @@ class App:
                             nearest_box = tl_det_box
                             nearest_conf = 0.6 if nearest_conf is None else max(0.6, nearest_conf)
 
-                if not getattr(self.args, 'no_opencv', False) and not self.headless:
-                    hud_dist = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
-                    y_text = 24
-                    mode_label = 'depth camera'
-                    if self.args.range_est == 'pinhole': mode_label = 'pinhole'
-                    elif self.args.range_est == 'stereo': mode_label = 'stereo camera'
-                    cv2.putText(hud_dist, f'Ego→Object distances ({mode_label}, meters):', (10, y_text),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                    y_text += 28
-                    det_points.sort(key=lambda d: d['z'])
-                    if det_points:
-                        for d in det_points[:22]:
-                            xcam, ycam, zcam = d['xyz']
-                            cv2.putText(hud_dist, f"{d['name']:<14}  Z={zcam:5.1f} m   X={xcam:+4.1f} m   Y={ycam:+4.1f} m",
-                                        (10, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 255, 0), 1)
-                            y_text += 22
-                    else:
-                        cv2.putText(hud_dist, 'No detections', (10, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180,180,180), 1)
-                    cv2.imshow('HUD_DIST', hud_dist)
                 if stop_detected_current: stop_persist_count += 1
                 else: stop_persist_count = 0
                 if (not stop_armed) and (stop_persist_count >= self.args.persist_frames):
@@ -2401,15 +3230,34 @@ class App:
                 else:
                     red_green_since = -1.0
 
+                tracker_state = None
+                tracker_active_states: List[Dict[str, Any]] = []
+                tracked_distance_for_control = None
+                tracked_rate = None
+                tracker = getattr(self, '_lead_tracker', None)
+                if tracker is not None:
+                    obstacle_measurements = perc.get('obstacle_measurements', [])
+                    tracker_state, tracker_active_states = tracker.step(sim_time, obstacle_measurements)
+                    if tracker_state is not None:
+                        tracked_distance_for_control = tracker_state.get('distance')
+                        tracked_rate = tracker_state.get('rate')
+                lead_track_id = tracker_state.get('track_id') if tracker_state is not None else None
+                lead_track_count = len(tracker_active_states)
+                if tracked_distance_for_control is None:
+                    if nearest_s_active is not None:
+                        tracked_distance_for_control = nearest_s_active
+                    else:
+                        tracked_distance_for_control = last_s0
+                self._tracked_distance = tracked_distance_for_control
+                self._tracked_rate = tracked_rate
+
                 trigger_name = nearest_kind
-                if nearest_s_active is not None:
-                    last_s0 = nearest_s_active
 
                 # Control step via helper
                 throttle, brake, ctrl, hold_blocked, hold_reason, stop_armed, stop_latch_time, stop_release_ignore_until, dbg_map, I_err = \
                     self._control_step(trigger_name, nearest_s_active, nearest_thr,
                                        tl_state, tl_s_active, v, v_target, MU, ema_loop_ms,
-                                       last_s0, stop_armed, stop_latch_time, stop_release_ignore_until,
+                                       tracked_distance_for_control, stop_armed, stop_latch_time, stop_release_ignore_until,
                                        red_green_since, no_trigger_elapsed, no_red_elapsed,
                                        depth_m, depth_stereo_m, nearest_box, nearest_conf,
                                        I_err, v_prev)
@@ -2429,6 +3277,20 @@ class App:
                         abs_factor = abs_dbg.get('f_global')
                         abs_mu = abs_dbg.get('mu_est')
                         abs_regime = abs_dbg.get('regime')
+
+                # If a new brake command crosses the threshold, start measuring actuation latency
+                brake_cmd_for_latency = float(brake)
+                if (brake_cmd_for_latency >= ACTUATION_BRAKE_CMD_MIN and
+                        prev_brake_cmd < ACTUATION_BRAKE_CMD_MIN):
+                    pending_actuation = {
+                        'sensor_ts': sensor_timestamp if (sensor_timestamp is not None and math.isfinite(sensor_timestamp)) else sim_time,
+                        'control_ts': sim_time,
+                        'cmd_brake': brake_cmd_for_latency,
+                    }
+                elif brake_cmd_for_latency < (0.5 * ACTUATION_BRAKE_CMD_MIN):
+                    pending_actuation = None
+                prev_brake_cmd = brake_cmd_for_latency
+
                 dbg_map['brake'] = brake
                 dbg_map['abs_lambda_max'] = abs_lambda
                 dbg_map['abs_factor'] = abs_factor
@@ -2438,8 +3300,12 @@ class App:
                 dbg_D_safety_dyn = dbg_map.get('D_safety_dyn')
                 dbg_sigma_depth = dbg_map.get('sigma_depth')
                 dbg_gate_hit = dbg_map.get('gate_hit')
+                dbg_gate_confirmed = dbg_map.get('gate_confirmed')
                 dbg_a_des = dbg_map.get('a_des')
                 dbg_brake = dbg_map.get('brake')
+                dbg_ttc = dbg_map.get('ttc')
+                dbg_brake_stage = dbg_map.get('brake_stage')
+                dbg_brake_stage_factor = dbg_map.get('brake_stage_factor')
                 dbg_abs_lambda = dbg_map.get('abs_lambda_max')
                 dbg_abs_factor = dbg_map.get('abs_factor')
                 dbg_abs_mu = dbg_map.get('abs_mu')
@@ -2449,8 +3315,20 @@ class App:
                 brake_target = dbg_map.get('brake_target_dist')
                 dbg_latency_s = dbg_map.get('latency_s')
                 dbg_latency_ms = None if (dbg_latency_s is None) else (float(dbg_latency_s) * 1000.0)
+                if tracker_state is not None and tracker_state.get('distance') is not None:
+                    last_s0 = tracker_state.get('distance')
+                elif tracked_distance_for_control is not None:
+                    last_s0 = tracked_distance_for_control
+                else:
+                    last_s0 = None
                 if (not brake_reason) and hold_blocked and hold_reason in ('stop_sign','red_light','obstacle'):
                     brake_reason = hold_reason
+                hazard_since_prev = getattr(self, '_hazard_confirm_since', -1.0)
+                if bool(dbg_gate_confirmed):
+                    if hazard_since_prev < 0.0:
+                        self._hazard_confirm_since = sim_time
+                else:
+                    self._hazard_confirm_since = -1.0
                 current_dist = None
                 for cand in (brake_target, nearest_s_active, tl_s_active if tl_state == 'RED' else None, last_s0):
                     if cand is None:
@@ -2483,6 +3361,15 @@ class App:
                 else:
                     false_stop_flag = False
 
+                tracker_distance_logged = tracker_state.get('distance') if tracker_state is not None else None
+                tracker_rate_logged = tracked_rate
+                tracker_id_logged = tracker_state.get('track_id') if tracker_state is not None else None
+                tracker_count_logged = lead_track_count
+                control_timestamp = sim_time
+                sensor_to_control_ms = None
+                if sensor_timestamp is not None and math.isfinite(sensor_timestamp):
+                    sensor_to_control_ms = max(0.0, (control_timestamp - float(sensor_timestamp)) * 1000.0)
+
                 # --- Episode bookkeeping: start/end of braking events ---
                 reason_allowed = brake_reason in ('obstacle','stop_sign','red_light')
                 hold_brake = hold_blocked and hold_reason in ('stop_sign','red_light','obstacle')
@@ -2514,6 +3401,17 @@ class App:
                     episode_abs_factor_count = 0
                     episode_false_flag = False
                     episode_t_start = sim_time
+                    if dbg_ttc is not None and math.isfinite(dbg_ttc):
+                        episode_ttc_init = float(dbg_ttc)
+                        episode_ttc_min = float(dbg_ttc)
+                    else:
+                        episode_ttc_init = None
+                        episode_ttc_min = None
+                    hazard_since = getattr(self, '_hazard_confirm_since', -1.0)
+                    if hazard_since >= 0.0:
+                        episode_reaction_time = max(0.0, sim_time - hazard_since)
+                    else:
+                        episode_reaction_time = None
                 elif episode_active:
                     if current_dist is not None:
                         episode_s_min = min(episode_s_min, current_dist)
@@ -2526,6 +3424,15 @@ class App:
                         episode_abs_factor_count += 1
                     if false_stop_flag:
                         episode_false_flag = True
+                    if dbg_ttc is not None and math.isfinite(dbg_ttc):
+                        if episode_ttc_min is None:
+                            episode_ttc_min = float(dbg_ttc)
+                        else:
+                            episode_ttc_min = min(episode_ttc_min, float(dbg_ttc))
+                    if episode_reaction_time is None and (brake_active or hold_brake):
+                        hazard_since = getattr(self, '_hazard_confirm_since', -1.0)
+                        if hazard_since >= 0.0:
+                            episode_reaction_time = max(0.0, sim_time - hazard_since)
                     still_active = activation
                     # Episode considered finished once vehicle has effectively stopped
                     # or braking band / hold is released (returned to cruising).
@@ -2548,6 +3455,9 @@ class App:
                                 if stopped:
                                     theoretical = episode_v_init / max(0.1, MU * 9.81)
                                     tts_margin = t_to_stop - theoretical
+                                ttc_init_logged = episode_ttc_init if (episode_ttc_init is not None and math.isfinite(episode_ttc_init)) else None
+                                ttc_min_logged = episode_ttc_min if (episode_ttc_min is not None and math.isfinite(episode_ttc_min)) else None
+                                reaction_logged = episode_reaction_time if (episode_reaction_time is not None and math.isfinite(episode_reaction_time)) else None
                                 max_lambda_val = episode_lambda_max if episode_lambda_max > 0 else None
                                 mean_abs_factor = None
                                 if episode_abs_factor_count > 0:
@@ -2568,6 +3478,9 @@ class App:
                                     collision_state,
                                     range_margin,
                                     tts_margin,
+                                    ttc_init_logged,
+                                    ttc_min_logged,
+                                    reaction_logged,
                                     max_lambda_val,
                                     mean_abs_factor,
                                     false_stop_episode,
@@ -2581,6 +3494,9 @@ class App:
                         episode_abs_factor_sum = 0.0
                         episode_abs_factor_count = 0
                         episode_false_flag = False
+                        episode_ttc_init = None
+                        episode_ttc_min = None
+                        episode_reaction_time = None
 
                 self._prev_brake_activation = activation
 
@@ -2601,12 +3517,18 @@ class App:
 
                 collision_flag = bool(getattr(self.world, 'collision_happened', False))
                 if not self.headless:
-                    self._draw_hud(self.screen, bgr, img_top, perf_fps, perf_ms, x, y, z, yaw, compass,
+                    mode_label = 'depth camera'
+                    if self.args.range_est == 'pinhole': mode_label = 'pinhole'
+                    elif self.args.range_est == 'stereo': mode_label = 'stereo camera'
+                    elif self.args.range_est == 'both': mode_label = 'depth + pinhole log'
+                    self._draw_hud(self.screen, bgr, perf_fps, perf_ms, x, y, z, yaw, compass,
                                    frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
                                    hold_reason, no_trigger_elapsed, no_red_elapsed, stop_armed,
                                    stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
                                    dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target,
-                                   collision_flag, dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime)
+                                   collision_flag, det_points, mode_label,
+                                   dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime,
+                                   tele_bgr)
 
                 # Periodic concise console log for tuning
                 logN = int(getattr(self.args, 'log_interval_frames', 0) or 0)
@@ -2637,6 +3559,14 @@ class App:
                                 bool(v < V_STOP),
                                 0.0,
                                 True,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                False,
                             )
                         except Exception:
                             pass
@@ -2647,16 +3577,17 @@ class App:
                 perf_ms = loop_ms
                 perf_fps = 1000.0 / loop_ms if loop_ms > 0 else 0.0
                 ema_loop_ms = 0.9*ema_loop_ms + 0.1*loop_ms
+                loop_ms_max = max(loop_ms_max, loop_ms)
                 v_prev = v
-                if not getattr(self.args, 'no_opencv', False) and not self.headless:
-                    cv2.waitKey(1)
 
                 if not self.headless:
                     for e in pygame.event.get():
                         if e.type == pygame.QUIT:
+                            shutdown_reason = 'pygame QUIT event'
                             raise KeyboardInterrupt
                         elif e.type == pygame.KEYDOWN:
                             if e.key == pygame.K_ESCAPE:
+                                shutdown_reason = 'ESC pressed'
                                 raise KeyboardInterrupt
                             elif e.key == pygame.K_LEFTBRACKET:
                                 self.detector.conf_thr = max(0.05, round(self.detector.conf_thr - 0.05, 2))
@@ -2689,16 +3620,33 @@ class App:
                         self.telemetry.maybe_log(sim_time, v, dbg_tau_dyn, dbg_D_safety_dyn, dbg_sigma_depth,
                                                  dbg_a_des, dbg_brake,
                                                  dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime,
-                                                 loop_ms, detect_ms, dbg_latency_ms,
+                                                 loop_ms, loop_ms_max, detect_ms, dbg_latency_ms,
                                                  a_long, x_rel_gt, range_est,
-                                                 dbg_gate_hit, false_stop_flag)
+                                                 dbg_ttc,
+                                                 dbg_gate_hit, dbg_gate_confirmed,
+                                                 false_stop_flag,
+                                                 dbg_brake_stage, dbg_brake_stage_factor,
+                                                 tracker_distance_logged, tracker_rate_logged,
+                                                 tracker_id_logged, tracker_count_logged,
+                                                 sensor_timestamp, control_timestamp,
+                                                 sensor_to_control_ms,
+                                                 last_actuation_ts, last_control_to_act_ms,
+                                                 last_sensor_to_act_ms)
                     except Exception:
                         pass
                 clock.tick(int(1.0/DT))
         except KeyboardInterrupt:
-            pass
+            if shutdown_reason == 'running':
+                shutdown_reason = 'KeyboardInterrupt'
+        except Exception as e:
+            shutdown_reason = f'unhandled exception: {e.__class__.__name__}: {e}'
+            traceback.print_exc()
         finally:
             t0 = time.time()
+            try:
+                print(f'[SHUTDOWN] Reason: {shutdown_reason}')
+            except Exception:
+                pass
             try:
                 print('[SHUTDOWN] Closing windows...')
                 self._close_windows()
@@ -2732,6 +3680,15 @@ class App:
                     self.scenario_logger.close()
                 except Exception:
                     pass
+            try:
+                self._maybe_write_telephoto_compute_summary()
+            except Exception:
+                pass
+            if self.telephoto_compute_fp is not None:
+                try:
+                    self.telephoto_compute_fp.close()
+                except Exception:
+                    pass
             if self.video_writer is not None:
                 try:
                     self.video_writer.release()
@@ -2758,6 +3715,24 @@ def parse_args():
                         help='Also set wheel.tire_friction≈mu to make the sim physically slick.')
     parser.add_argument('--persist-frames', type=int, default=2,
                         help='Consecutive frames required to confirm a stop‑sign before arming the stop latch')
+    parser.add_argument('--min-aeb-speed', type=float, default=V_AEB_MIN_DEFAULT,
+                        help='Minimum ego speed (m/s) before obstacle-triggered AEB can engage')
+    parser.add_argument('--gate-confirm-frames', type=int, default=GATE_CONFIRM_FRAMES_DEFAULT,
+                        help='Consecutive gate-hit frames required before obstacle braking is allowed')
+    parser.add_argument('--ttc-confirm-s', type=float, default=TTC_CONFIRM_S_DEFAULT,
+                        help='TTC threshold (seconds) that must be met before obstacle braking is allowed')
+    parser.add_argument('--ttc-stage-strong', type=float, default=TTC_STAGE_STRONG_DEFAULT,
+                        help='TTC threshold (seconds) to escalate from comfort to strong braking once confirmed')
+    parser.add_argument('--ttc-stage-full', type=float, default=TTC_STAGE_FULL_DEFAULT,
+                        help='TTC threshold (seconds) to escalate from strong to full AEB braking')
+    parser.add_argument('--aeb-stage-comfort', type=float, default=BRAKE_STAGE_COMFORT_FACTOR,
+                        help='Fraction of μg to request during the comfort braking stage (0..1)')
+    parser.add_argument('--aeb-stage-strong', type=float, default=BRAKE_STAGE_STRONG_FACTOR,
+                        help='Fraction of μg to request during the strong braking stage (0..1)')
+    parser.add_argument('--aeb-ramp-up', type=float, default=AEB_RAMP_UP_DEFAULT,
+                        help='Max increase rate for a_des (m/s^2 per second) when escalating braking')
+    parser.add_argument('--aeb-ramp-down', type=float, default=AEB_RAMP_DOWN_DEFAULT,
+                        help='Max decrease rate for a_des (m/s^2 per second) when relaxing braking')
     parser.add_argument('--range-est', type=str, default='pinhole',
                         choices=['pinhole', 'depth', 'stereo', 'both'],
                         help='Distance source: monocular pinhole, CARLA depth, stereo vision, or log both (depth vs pinhole)')
@@ -2771,13 +3746,22 @@ def parse_args():
                         help='ROI shrink factor (0..0.9) when sampling stereo disparity depth')
     # Visualization toggles
     parser.add_argument('--no-depth-viz', action='store_true',
-                        help='Hide the DEPTH/HUD_DIST OpenCV windows (alias for --no-opencv)')
+                        help='(Deprecated) Legacy alias for --no-opencv; OpenCV windows are no longer used')
     parser.add_argument('--no-opencv', action='store_true',
-                        help='Disable OpenCV windows entirely (depth/HUD_DIST)')
+                        help='(Deprecated) No effect now that depth/HUD HUD_DIST windows render inside pygame')
     parser.add_argument('--no-top-cam', action='store_true',
                         help='Disable spawning the top view camera and hide it from the HUD')
     parser.add_argument('--no-depth-cam', action='store_true',
                         help='Disable spawning the depth camera (range_est depth will be auto-fallback)')
+    parser.add_argument('--no-telephoto', action='store_true',
+                        help='Disable the telephoto traffic-light helper camera and detector scheduling')
+    parser.add_argument('--telephoto-stride', type=int, default=TELEPHOTO_STRIDE_DEFAULT,
+                        help='Run telephoto YOLO inference every N frames (>=2). Default=3')
+    parser.add_argument('--telephoto-zoom', type=float, default=TELEPHOTO_DIGITAL_ZOOM_DEFAULT,
+                        help='Digital zoom factor (>=1.0) for the telephoto feed (crop upper-center, resize, reuse boxes).'
+                             ' Default=1.5; set to 1.0 to disable')
+    parser.add_argument('--telephoto-compute-log', type=str, default=None,
+                        help='Optional CSV path to log total compute time with/without telephoto assists (plus cache/skip stats)')
     parser.add_argument('--headless', action='store_true',
                         help='Run without GUI windows (also disables OpenCV windows)')
 
