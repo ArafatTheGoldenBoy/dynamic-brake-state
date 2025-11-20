@@ -1456,7 +1456,9 @@ class App:
                 if trigger_name and 'traffic light' in trigger_name:
                     hold_reason = 'red_light'
                 elif trigger_name and 'stop sign' in trigger_name:
-                    hold_reason = 'stop_sign'; stop_latch_time = self._sim_time; stop_armed = False
+                    hold_reason = 'stop_sign'
+                    stop_latch_time = self._sim_time
+                    stop_armed = False
             else:
                 hold_reason = 'obstacle'
 
@@ -1484,9 +1486,9 @@ class App:
                     release = True
 
             if release:
-                hold_blocked = False; hold_reason = None; last_s0 = None
-                if hasattr(self, '_lead_tracker') and self._lead_tracker is not None:
-                    self._lead_tracker.deactivate()
+                hold_blocked = False
+                hold_reason = None
+                last_s0 = None
                 self._aeb_a_des = 0.0
                 throttle, brake = 0.0, 0.0
                 self._kick_until = self._sim_time + KICK_SEC
@@ -1631,25 +1633,27 @@ class App:
         v_target = float(V_TARGET)
         dist_total = 0.0
         perf_ms = 0.0; perf_fps = 0.0; ema_loop_ms = DT * 1000.0
-        v_prev = None; I_err = 0.0
+        ctx = self.control_ctx
+        ctx.I_err = 0.0
+        ctx.v_prev = 0.0
         loop_ms_max = 0.0
         sigma_depth_ema = 0.40
         sigma_depth_max_step = 0.50
         stop_persist_count = 0
         hold_blocked = False
         hold_reason   = None
-        last_s0 = None
-        tracked_rate = None
+        ctx.last_s0 = 0.0
+        ctx.tracked_rate = None
         prev_loc = None
         sim_time = 0.0
         sensor_timestamp = None
         kick_until = 0.0
-        stop_latch_time = -1.0
-        stop_armed = False
-        stop_release_ignore_until = -1.0
-        red_green_since = -1.0
-        no_trigger_elapsed = 0.0
-        no_red_elapsed = 0.0
+        ctx.stop_latch_time = -1.0
+        ctx.stop_armed = False
+        ctx.stop_release_ignore_until = -1.0
+        ctx.red_green_since = -1.0
+        ctx.no_trigger_elapsed = 0.0
+        ctx.no_red_elapsed = 0.0
         hud_msg = ''
         hud_until = 0.0
         conf_thr = CONF_THR_DEFAULT
@@ -1742,7 +1746,7 @@ class App:
                 v = ALPHA_VBLEND * v_raw + (1.0 - ALPHA_VBLEND) * v_disp
                 if v < 0.05: v = 0.0
                 wheel_speeds = self._get_wheel_linear_speeds()
-                a_long = 0.0 if v_prev is None else (v - v_prev) / DT
+                a_long = 0.0 if ctx.v_prev is None else (v - ctx.v_prev) / DT
 
                 # Check if a pending actuation measurement can be resolved
                 if pending_actuation is not None:
@@ -1866,23 +1870,22 @@ class App:
 
                 if stop_detected_current: stop_persist_count += 1
                 else: stop_persist_count = 0
-                if (not stop_armed) and (stop_persist_count >= self.args.persist_frames):
-                    stop_armed = True; stop_latch_time = sim_time
+                if (not ctx.stop_armed) and (stop_persist_count >= self.args.persist_frames):
+                    ctx.stop_armed = True; ctx.stop_latch_time = sim_time
 
-                if nearest_s_active is None: no_trigger_elapsed += DT
-                else: no_trigger_elapsed = 0.0
+                if nearest_s_active is None: ctx.no_trigger_elapsed += DT
+                else: ctx.no_trigger_elapsed = 0.0
 
-                if any_red_tl: no_red_elapsed = 0.0; red_green_since = -1.0
-                else: no_red_elapsed += DT
+                if any_red_tl: ctx.no_red_elapsed = 0.0; ctx.red_green_since = -1.0
+                else: ctx.no_red_elapsed += DT
                 if (tl_state == 'GREEN'):
-                    if red_green_since < 0:
-                        red_green_since = sim_time
+                    if ctx.red_green_since < 0:
+                        ctx.red_green_since = sim_time
                 else:
-                    red_green_since = -1.0
+                    ctx.red_green_since = -1.0
 
                 tracker_state = None
                 tracked_distance_for_control = None
-                tracked_rate = None
                 lead_track_id = None
                 lead_track_count = 0
                 tracker = getattr(self, '_lead_tracker', None)
@@ -1897,16 +1900,15 @@ class App:
                     tracker_state = tracker.step(sim_time, measurement)
                     if tracker_state is not None:
                         tracked_distance_for_control = tracker_state.get('distance')
-                        tracked_rate = tracker_state.get('rate')
+                        ctx.tracked_rate = tracker_state.get('rate')
                         lead_track_id = tracker_state.get('id')
                         lead_track_count = tracker_state.get('tracker_count', 0)
                 if tracked_distance_for_control is None:
                     if nearest_s_active is not None:
                         tracked_distance_for_control = nearest_s_active
                     else:
-                        tracked_distance_for_control = last_s0
+                        tracked_distance_for_control = ctx.last_s0
                 self._tracked_distance = tracked_distance_for_control
-                self._tracked_rate = tracked_rate
 
                 trigger_name = nearest_kind
 
@@ -1923,18 +1925,18 @@ class App:
                         mu=MU,
                         ema_loop_ms=ema_loop_ms,
                         tracked_distance_for_control=tracked_distance_for_control,
-                        stop_armed=stop_armed,
-                        stop_latch_time=stop_latch_time,
-                        stop_release_ignore_until=stop_release_ignore_until,
-                        red_green_since=red_green_since,
-                        no_trigger_elapsed=no_trigger_elapsed,
-                        no_red_elapsed=no_red_elapsed,
+                        stop_armed=ctx.stop_armed,
+                        stop_latch_time=ctx.stop_latch_time,
+                        stop_release_ignore_until=ctx.stop_release_ignore_until,
+                        red_green_since=ctx.red_green_since,
+                        no_trigger_elapsed=ctx.no_trigger_elapsed,
+                        no_red_elapsed=ctx.no_red_elapsed,
                         depth_m=depth_m,
                         depth_stereo_m=depth_stereo_m,
                         nearest_box=nearest_box,
                         nearest_conf=nearest_conf,
-                        I_err=I_err,
-                        v_prev=v_prev,
+                        I_err=ctx.I_err,
+                        v_prev=ctx.v_prev,
                     )
                     try:
                         planning_decision = self.ecu_pipeline.run_planning(plan_job, timeout=self.ecu_process_timeout)
@@ -1945,9 +1947,9 @@ class App:
                             ctrl=None,
                             hold_blocked=True,
                             hold_reason=f'PLANNING_PROC_FAIL:{exc}',
-                            stop_armed=stop_armed,
-                            stop_latch_time=stop_latch_time,
-                            stop_release_ignore_until=stop_release_ignore_until,
+                            stop_armed=ctx.stop_armed,
+                            stop_latch_time=ctx.stop_latch_time,
+                            stop_release_ignore_until=ctx.stop_release_ignore_until,
                             debug={},
                             integral_error=I_err,
                             aeb_request=None,
@@ -1967,18 +1969,18 @@ class App:
                         MU,
                         ema_loop_ms,
                         tracked_distance_for_control,
-                        stop_armed,
-                        stop_latch_time,
-                        stop_release_ignore_until,
-                        red_green_since,
-                        no_trigger_elapsed,
-                        no_red_elapsed,
+                        ctx.stop_armed,
+                        ctx.stop_latch_time,
+                        ctx.stop_release_ignore_until,
+                        ctx.red_green_since,
+                        ctx.no_trigger_elapsed,
+                        ctx.no_red_elapsed,
                         depth_m,
                         depth_stereo_m,
                         nearest_box,
                         nearest_conf,
-                        I_err,
-                        v_prev,
+                        ctx.I_err,
+                        ctx.v_prev,
                     )
                 planning_decision.validate(freshness_s=self.safety_calibration.planning_freshness_s)
                 self.bus.send('planning', planning_decision, now=sim_time, latency_s=self.bus_latency_planning)
@@ -1993,11 +1995,11 @@ class App:
                 ctrl = planning_decision.ctrl
                 hold_blocked = planning_decision.hold_blocked
                 hold_reason = planning_decision.hold_reason
-                stop_armed = planning_decision.stop_armed
-                stop_latch_time = planning_decision.stop_latch_time
-                stop_release_ignore_until = planning_decision.stop_release_ignore_until
+                ctx.stop_armed = planning_decision.stop_armed
+                ctx.stop_latch_time = planning_decision.stop_latch_time
+                ctx.stop_release_ignore_until = planning_decision.stop_release_ignore_until
                 dbg_map = planning_decision.debug
-                I_err = planning_decision.integral_error
+                ctx.I_err = planning_decision.integral_error
                 perception_latency_ms = (time.time() - perc.timestamp) * 1000.0 if hasattr(perc, 'timestamp') else None
                 planning_latency_ms = (time.time() - planning_decision.timestamp) * 1000.0
                 dbg_map = dict(dbg_map or {})
@@ -2094,11 +2096,9 @@ class App:
                 dbg_latency_s = dbg_map.get('latency_s')
                 dbg_latency_ms = None if (dbg_latency_s is None) else (float(dbg_latency_s) * 1000.0)
                 if tracker_state is not None and tracker_state.get('distance') is not None:
-                    last_s0 = tracker_state.get('distance')
+                    ctx.last_s0 = tracker_state.get('distance')
                 elif tracked_distance_for_control is not None:
-                    last_s0 = tracked_distance_for_control
-                else:
-                    last_s0 = None
+                    ctx.last_s0 = tracked_distance_for_control
                 if (not brake_reason) and hold_blocked and hold_reason in ('stop_sign','red_light','obstacle'):
                     brake_reason = hold_reason
                 hazard_since_prev = getattr(self, '_hazard_confirm_since', -1.0)
@@ -2108,7 +2108,7 @@ class App:
                 else:
                     self._hazard_confirm_since = -1.0
                 current_dist = None
-                for cand in (brake_target, nearest_s_active, tl_s_active if tl_state == 'RED' else None, last_s0):
+                for cand in (brake_target, nearest_s_active, tl_s_active if tl_state == 'RED' else None, ctx.last_s0):
                     if cand is None:
                         continue
                     try:
@@ -2140,7 +2140,7 @@ class App:
                     false_stop_flag = False
 
                 tracker_distance_logged = tracker_state.get('distance') if tracker_state is not None else None
-                tracker_rate_logged = tracked_rate
+                tracker_rate_logged = ctx.tracked_rate
                 tracker_id_logged = tracker_state.get('track_id') if tracker_state is not None else None
                 tracker_count_logged = lead_track_count
                 control_timestamp = sim_time
@@ -2299,14 +2299,16 @@ class App:
                     if self.args.range_est == 'pinhole': mode_label = 'pinhole'
                     elif self.args.range_est == 'stereo': mode_label = 'stereo camera'
                     elif self.args.range_est == 'both': mode_label = 'depth + pinhole log'
-                    self._draw_hud(self.screen, bgr, perf_fps, perf_ms, x, y, z, yaw, compass,
-                                   frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
-                                   hold_reason, no_trigger_elapsed, no_red_elapsed, stop_armed,
-                                   stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
-                                   dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target,
-                                   collision_flag, det_points, mode_label,
-                                   dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime,
-                                   tele_bgr)
+                    self._draw_hud(
+                        self.screen, bgr, perf_fps, perf_ms, x, y, z, yaw, compass,
+                        frame_id, v, trigger_name, tl_state, throttle, brake, hold_blocked,
+                        hold_reason, ctx.no_trigger_elapsed, ctx.no_red_elapsed, ctx.stop_armed,
+                        ctx.stop_release_ignore_until, sim_time, dbg_tau_dyn, dbg_D_safety_dyn,
+                        dbg_sigma_depth, dbg_gate_hit, dbg_a_des, dbg_brake, v_target,
+                        collision_flag, det_points, mode_label,
+                        dbg_abs_lambda, dbg_abs_factor, dbg_abs_mu, dbg_abs_regime,
+                        tele_bgr,
+                    )
 
                 # Periodic concise console log for tuning
                 logN = int(getattr(self.args, 'log_interval_frames', 0) or 0)
@@ -2356,7 +2358,7 @@ class App:
                 perf_fps = 1000.0 / loop_ms if loop_ms > 0 else 0.0
                 ema_loop_ms = 0.9*ema_loop_ms + 0.1*loop_ms
                 loop_ms_max = max(loop_ms_max, loop_ms)
-                v_prev = v
+                ctx.v_prev = v
 
                 if not self.headless:
                     for e in pygame.event.get():
