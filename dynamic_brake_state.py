@@ -8,7 +8,7 @@ import numpy as np
 import pygame
 import cv2
 
-from calibrations import load_aeb_calibration
+from calibrations import load_aeb_calibration, load_bus_calibration, load_safety_calibration
 from ecu import ActuationECU, MessageBus, PerceptionECU, PlanningECU, SafetyManager
 
 # Ensure CARLA Python egg is on sys.path before importing carla (supports common layouts)
@@ -2004,25 +2004,60 @@ class App:
         self.bus = MessageBus()
         self.bus_latency_perception = max(0.0, float(getattr(self.args, 'bus_latency_perception', 0.0)))
         self.bus_latency_planning = max(0.0, float(getattr(self.args, 'bus_latency_planning', 0.0)))
-        self.bus.configure_topic(
-            'perception',
-            drop_rate=max(0.0, min(1.0, float(getattr(self.args, 'bus_drop_perception', 0.0)))),
-            jitter_s=max(0.0, float(getattr(self.args, 'bus_jitter_perception', 0.0))),
-            max_age_s=0.3,
-        )
-        self.bus.configure_topic(
-            'planning',
-            drop_rate=max(0.0, min(1.0, float(getattr(self.args, 'bus_drop_planning', 0.0)))),
-            jitter_s=max(0.0, float(getattr(self.args, 'bus_jitter_planning', 0.0))),
-            max_age_s=0.3,
-        )
+        bus_defaults = {
+            'perception': {
+                'drop_rate': max(0.0, min(1.0, float(getattr(self.args, 'bus_drop_perception', 0.0)))),
+                'jitter_s': max(0.0, float(getattr(self.args, 'bus_jitter_perception', 0.0))),
+                'max_age_s': 0.35,
+                'max_depth': 8,
+                'deadline_s': max(0.05, float(getattr(self.args, 'bus_deadline_perception', 0.15))),
+                'priority': 1,
+            },
+            'planning': {
+                'drop_rate': max(0.0, min(1.0, float(getattr(self.args, 'bus_drop_planning', 0.0)))),
+                'jitter_s': max(0.0, float(getattr(self.args, 'bus_jitter_planning', 0.0))),
+                'max_age_s': 0.35,
+                'max_depth': 8,
+                'deadline_s': max(0.05, float(getattr(self.args, 'bus_deadline_planning', 0.15))),
+                'priority': 0,
+            },
+        }
+        self.bus_calibration = load_bus_calibration(getattr(self.args, 'bus_calibration_file', None), bus_defaults)
+        for topic, cfg in self.bus_calibration.items():
+            self.bus.configure_topic(
+                topic,
+                drop_rate=cfg.drop_rate,
+                jitter_s=cfg.jitter_s,
+                max_age_s=cfg.max_age_s,
+                max_depth=cfg.max_depth,
+                deadline_s=cfg.deadline_s,
+                priority=cfg.priority,
+            )
         self.perception_ecu = PerceptionECU(self._perception_step)
         self.planning_ecu = PlanningECU(self._control_step)
         self.actuation_ecu = ActuationECU(
             abs_fn=(None if self.abs_actuator is None else self.abs_actuator.step),
             abs_debug_fn=(None if self.abs_actuator is None else self.abs_actuator.debug_metrics),
         )
-        self.safety_manager = SafetyManager()
+        safety_defaults = {
+            'perception_freshness_s': float(getattr(self.args, 'perception_freshness_s', 0.35)),
+            'planning_freshness_s': float(getattr(self.args, 'planning_freshness_s', 0.35)),
+            'actuation_freshness_s': float(getattr(self.args, 'actuation_freshness_s', 0.35)),
+            'ttc_floor_s': float(getattr(self.args, 'safety_ttc_floor_s', 0.25)),
+            'v_min_plausible': float(getattr(self.args, 'safety_v_min_plausible', 0.5)),
+            'wheel_slip_max': float(getattr(self.args, 'safety_wheel_slip_max', 0.45)),
+            'brake_fail_safe': float(getattr(self.args, 'brake_fail_safe', 1.0)),
+        }
+        self.safety_calibration = load_safety_calibration(getattr(self.args, 'safety_calibration_file', None), safety_defaults)
+        self.safety_manager = SafetyManager(
+            brake_fail_safe=self.safety_calibration.brake_fail_safe,
+            perception_freshness_s=self.safety_calibration.perception_freshness_s,
+            planning_freshness_s=self.safety_calibration.planning_freshness_s,
+            actuation_freshness_s=self.safety_calibration.actuation_freshness_s,
+            ttc_floor_s=self.safety_calibration.ttc_floor_s,
+            v_min_plausible=self.safety_calibration.v_min_plausible,
+            wheel_slip_max=self.safety_calibration.wheel_slip_max,
+        )
         self._lead_tracker = LeadMultiObjectTracker(dt=DT)
         # Telemetry set up
         self.telemetry: Optional[_TelemetryLogger] = None
@@ -3194,7 +3229,7 @@ class App:
                 )
                 detect_ms = (time.time() - detect_t0) * 1000.0
                 perc.frame_id = self._frame_index
-                perc.validate()
+                perc.validate(freshness_s=self.safety_calibration.perception_freshness_s)
                 self.bus.send('perception', perc, now=sim_time, latency_s=self.bus_latency_perception)
                 perc_bus = self.bus.receive_latest('perception', now=sim_time, max_age_s=0.3)
                 perc = perc_bus or perc
@@ -3301,7 +3336,7 @@ class App:
                     I_err,
                     v_prev,
                 )
-                planning_decision.validate()
+                planning_decision.validate(freshness_s=self.safety_calibration.planning_freshness_s)
                 self.bus.send('planning', planning_decision, now=sim_time, latency_s=self.bus_latency_planning)
                 planning_from_bus = self.bus.receive_latest('planning', now=sim_time, max_age_s=0.3)
                 if planning_from_bus is not None:
@@ -3329,6 +3364,11 @@ class App:
                     'perception': dict(self.bus.metrics.get('perception', {})),
                     'planning': dict(self.bus.metrics.get('planning', {})),
                 }
+                dbg_map['calibration_meta'] = {
+                    'aeb': getattr(self.calibration, 'metadata', {}),
+                    'safety': getattr(self.safety_calibration, 'metadata', {}),
+                    'bus': {k: vars(v) for k, v in self.bus_calibration.items()},
+                }
                 if planning_decision.aeb_request is not None:
                     dbg_map['aeb_request'] = {
                         'mode': planning_decision.aeb_request.mode,
@@ -3341,20 +3381,22 @@ class App:
                 abs_regime = 'off' if self.abs_actuator is None else None
                 abs_dbg = None
                 abs_result = self.actuation_ecu.apply_abs(brake, v, wheel_speeds, a_long)
-                abs_result.validate()
+                abs_result.validate(freshness_s=self.safety_calibration.actuation_freshness_s)
                 brake = abs_result.get('brake', brake)
                 abs_dbg = abs_result.get('abs_dbg')
                 planning_decision.brake = brake
                 if not abs_result.valid:
                     brake = max(brake, 1.0)
                     dbg_map['abs_fault'] = abs_result.fault_code or 'UNKNOWN_ABS_FAULT'
-                safety = self.safety_manager.evaluate(perc, planning_decision, abs_result)
+                safety = self.safety_manager.evaluate(perc, planning_decision, abs_result, v_ego=v, ttc=dbg_map.get('ttc'))
                 if safety.mode != 'NOMINAL':
                     throttle = safety.throttle
                     brake = max(brake, safety.brake)
                 dbg_map['safety_mode'] = safety.mode
                 if safety.faults:
                     dbg_map['safety_faults'] = list(safety.faults)
+                if safety.latched:
+                    dbg_map['safety_faults_latched'] = list(safety.latched)
                 if abs_dbg is not None:
                     abs_lambda = abs_dbg.get('lambda_max')
                     abs_factor = abs_dbg.get('f_global')
@@ -3798,6 +3840,36 @@ def parse_args():
                         help='Simulated bus latency (seconds) from perception ECU to planning ECU')
     parser.add_argument('--bus-latency-planning', type=float, default=0.0,
                         help='Simulated bus latency (seconds) from planning ECU to actuation ECU')
+    parser.add_argument('--bus-drop-perception', type=float, default=0.0,
+                        help='Probability of dropping a perception->planning message (0-1)')
+    parser.add_argument('--bus-drop-planning', type=float, default=0.0,
+                        help='Probability of dropping a planning->actuation message (0-1)')
+    parser.add_argument('--bus-jitter-perception', type=float, default=0.0,
+                        help='Uniform jitter (seconds) applied to perception messages')
+    parser.add_argument('--bus-jitter-planning', type=float, default=0.0,
+                        help='Uniform jitter (seconds) applied to planning messages')
+    parser.add_argument('--bus-deadline-perception', type=float, default=0.15,
+                        help='Deadline (seconds) for consuming perception messages before counting a miss')
+    parser.add_argument('--bus-deadline-planning', type=float, default=0.15,
+                        help='Deadline (seconds) for consuming planning messages before counting a miss')
+    parser.add_argument('--bus-calibration-file', type=str, default=None,
+                        help='Optional JSON file describing bus topic configs (drop, jitter, max_age, deadline, priority)')
+    parser.add_argument('--safety-calibration-file', type=str, default=None,
+                        help='Optional JSON file describing safety envelopes and freshness thresholds')
+    parser.add_argument('--perception-freshness-s', type=float, default=0.35,
+                        help='Max allowed age for perception outputs before they are treated as stale')
+    parser.add_argument('--planning-freshness-s', type=float, default=0.35,
+                        help='Max allowed age for planning outputs before they are treated as stale')
+    parser.add_argument('--actuation-freshness-s', type=float, default=0.35,
+                        help='Max allowed age for actuation outputs before they are treated as stale')
+    parser.add_argument('--safety-ttc-floor-s', type=float, default=0.25,
+                        help='TTC floor below which the safety monitor flags implausible readings')
+    parser.add_argument('--safety-v-min-plausible', type=float, default=0.5,
+                        help='Velocity floor for plausibility checks')
+    parser.add_argument('--safety-wheel-slip-max', type=float, default=0.45,
+                        help='Slip ratio bound before latching a slip fault')
+    parser.add_argument('--brake-fail-safe', type=float, default=1.0,
+                        help='Brake command applied in fail-safe mode when faults are latched')
     parser.add_argument('--apply-tire-friction', action='store_true',
                         help='Also set wheel.tire_friction≈mu to make the sim physically slick.')
     parser.add_argument('--persist-frames', type=int, default=2,

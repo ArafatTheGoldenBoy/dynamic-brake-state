@@ -13,12 +13,30 @@ import math
 import random
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 
 def _clamp(value: float, bounds: Tuple[float, float]) -> float:
     lo, hi = bounds
     return max(lo, min(hi, value))
+
+
+@dataclass
+class ComponentStatus:
+    """Health status emitted by each ECU for safety aggregation."""
+
+    name: str
+    ok: bool
+    faults: List[str] = field(default_factory=list)
+    severity: str = "INFO"
+    timestamp: float = field(default_factory=lambda: time.time())
+
+    def mark_fault(self, code: str, severity: str = "WARN") -> None:
+        if code not in self.faults:
+            self.faults.append(code)
+        self.ok = False
+        self.severity = severity
 
 
 @dataclass
@@ -70,11 +88,23 @@ class PerceptionSignal:
             if not math.isfinite(self.nearest_s_active) or self.nearest_s_active < 0:
                 self.valid = False
                 self.fault_code = self.fault_code or "NEGATIVE_DISTANCE"
+        if self.nearest_conf is not None and (self.nearest_conf < 0 or self.nearest_conf > 1.0):
+            self.valid = False
+            self.fault_code = self.fault_code or "CONFIDENCE_OOB"
         if self.nearest_conf is not None:
             self.nearest_conf = _clamp(float(self.nearest_conf), (0.0, 1.0))
         if self.tl_s_active is not None and self.tl_s_active < 0:
             self.valid = False
             self.fault_code = self.fault_code or "TL_DISTANCE_INVALID"
+        if self.obstacle_measurements:
+            for m in self.obstacle_measurements:
+                try:
+                    dist_val = float(m.get("distance", 0.0))
+                except Exception:
+                    dist_val = -1.0
+                if dist_val < 0:
+                    self.valid = False
+                    self.fault_code = self.fault_code or "OBSTACLE_DISTANCE_INVALID"
 
 
 @dataclass
@@ -116,10 +146,14 @@ class PlanningDecision:
         "brake": "[0,1]",
     })
 
-    def validate(self) -> None:
+    def validate(self, freshness_s: Optional[float] = None) -> None:
+        now = time.time()
         if not math.isfinite(self.timestamp):
             self.valid = False
             self.fault_code = self.fault_code or "BAD_TIMESTAMP"
+        elif freshness_s is not None and (now - float(self.timestamp) > freshness_s):
+            self.valid = False
+            self.fault_code = self.fault_code or "PLANNING_STALE"
         self.throttle = _clamp(float(self.throttle), (0.0, 1.0))
         self.brake = _clamp(float(self.brake), (0.0, 1.0))
         if self.aeb_request is not None:
@@ -127,7 +161,7 @@ class PlanningDecision:
                 self.aeb_request.validate()
             except Exception as exc:
                 self.valid = False
-                self.fault_code = self.fault_code or f"AEB_REQ_INVALID:{exc}" 
+                self.fault_code = self.fault_code or f"AEB_REQ_INVALID:{exc}"
 
     def as_tuple(self):
         return (
@@ -161,10 +195,14 @@ class ActuationResult:
     def get(self, key: str, default=None):
         return getattr(self, key, default)
 
-    def validate(self) -> None:
+    def validate(self, freshness_s: Optional[float] = None) -> None:
+        now = time.time()
         if not math.isfinite(self.timestamp):
             self.valid = False
             self.fault_code = self.fault_code or "ACT_TS_INVALID"
+        elif freshness_s is not None and (now - float(self.timestamp) > freshness_s):
+            self.valid = False
+            self.fault_code = self.fault_code or "ACT_STALE"
         self.brake = _clamp(float(self.brake), (0.0, 1.0))
 
 
@@ -299,7 +337,7 @@ class MessageBus:
     """In-process bus that approximates ECU message passing with faults."""
 
     def __init__(self):
-        self._queues: Dict[str, List[Tuple[float, int, Any]]] = {}
+        self._queues: Dict[str, List[Tuple[float, int, int, Any]]] = {}
         self._topic_config: Dict[str, Dict[str, float]] = {}
         self.metrics: Dict[str, Dict[str, float]] = {}
 
@@ -310,18 +348,24 @@ class MessageBus:
         jitter_s: float = 0.0,
         max_age_s: float = 0.5,
         max_depth: int = 8,
+        deadline_s: float = 0.25,
+        priority: int = 0,
     ) -> None:
         self._topic_config[topic] = {
             "drop_rate": max(0.0, min(1.0, drop_rate)),
             "jitter_s": max(0.0, jitter_s),
             "max_age_s": max(0.05, max_age_s),
             "max_depth": max(1, max_depth),
+            "deadline_s": max(0.01, deadline_s),
+            "priority": max(0, priority),
         }
         self.metrics[topic] = {
             "sent": 0,
             "dropped_tx": 0,
             "delivered": 0,
+            "deadline_miss": 0,
             "expired": 0,
+            "queue_depth": 0,
         }
 
     def _cfg(self, topic: str) -> Dict[str, float]:
@@ -335,6 +379,7 @@ class MessageBus:
         message: Any,
         now: Optional[float] = None,
         latency_s: float = 0.0,
+        priority: Optional[int] = None,
     ) -> None:
         cfg = self._cfg(topic)
         if random.random() < cfg["drop_rate"]:
@@ -344,10 +389,11 @@ class MessageBus:
         if cfg["jitter_s"] > 0.0:
             deliver_at += random.uniform(-cfg["jitter_s"], cfg["jitter_s"])
         q = self._queues.setdefault(topic, [])
-        q.append((deliver_at, len(q), message))
+        q.append((deliver_at, priority if priority is not None else cfg["priority"], len(q), message))
         if len(q) > cfg["max_depth"]:
             q.pop(0)
         self.metrics[topic]["sent"] += 1
+        self.metrics[topic]["queue_depth"] = len(q)
 
     def receive_latest(
         self, topic: str, now: Optional[float] = None, max_age_s: Optional[float] = None
@@ -356,33 +402,58 @@ class MessageBus:
         max_age = cfg["max_age_s"] if max_age_s is None else max_age_s
         now_ts = now if now is not None else time.time()
         queue = self._queues.get(topic, [])
-        ready = [(ts, prio, msg) for ts, prio, msg in queue if ts <= now_ts]
+        ready = [(ts, prio, idx, msg) for ts, prio, idx, msg in queue if ts <= now_ts]
         if not ready:
             return None
-        self._queues[topic] = [(ts, prio, msg) for ts, prio, msg in queue if ts > now_ts]
-        ready.sort(key=lambda t: (t[0], t[1]))
-        _, _, latest = ready[-1]
+        self._queues[topic] = [(ts, prio, idx, msg) for ts, prio, idx, msg in queue if ts > now_ts]
+        ready.sort(key=lambda t: (t[0], t[1], t[2]))
+        _, _, _, latest = ready[-1]
         age = now_ts - latest.timestamp if hasattr(latest, "timestamp") else 0.0
         if age > max_age:
             self.metrics[topic]["expired"] += 1
             return None
+        deadline_s = cfg.get("deadline_s", max_age)
+        if now_ts - ready[-1][0] > deadline_s:
+            self.metrics[topic]["deadline_miss"] += 1
         self.metrics[topic]["delivered"] += 1
         return latest
+
+
+class SafetyMode(str, Enum):
+    NOMINAL = "NOMINAL"
+    DEGRADED = "DEGRADED"
+    FAIL_SAFE = "FAIL_SAFE"
 
 
 @dataclass
 class SafetyDecision:
     throttle: float
     brake: float
-    mode: str
+    mode: SafetyMode
     faults: List[str] = field(default_factory=list)
+    latched: List[str] = field(default_factory=list)
 
 
 class SafetyManager:
     """Aggregates ECU faults and enforces degraded behavior."""
 
-    def __init__(self, brake_fail_safe: float = 1.0):
+    def __init__(
+        self,
+        brake_fail_safe: float = 1.0,
+        perception_freshness_s: float = 0.5,
+        planning_freshness_s: float = 0.5,
+        actuation_freshness_s: float = 0.5,
+        ttc_floor_s: float = 0.2,
+        v_min_plausible: float = 0.1,
+        wheel_slip_max: float = 1.0,
+    ):
         self.brake_fail_safe = _clamp(brake_fail_safe, (0.5, 1.0))
+        self.perception_freshness_s = perception_freshness_s
+        self.planning_freshness_s = planning_freshness_s
+        self.actuation_freshness_s = actuation_freshness_s
+        self.ttc_floor_s = ttc_floor_s
+        self.v_min_plausible = v_min_plausible
+        self.wheel_slip_max = wheel_slip_max
         self.latched_faults: List[str] = []
 
     def _latch(self, code: Optional[str]) -> None:
@@ -394,24 +465,65 @@ class SafetyManager:
         perception: Optional[PerceptionSignal],
         planning: Optional[PlanningDecision],
         actuation: Optional[ActuationResult],
+        v_ego: float = 0.0,
+        ttc: Optional[float] = None,
     ) -> SafetyDecision:
-        if perception is not None and (not perception.valid or perception.fault_code):
-            self._latch(perception.fault_code or "PERCEPTION_INVALID")
-        if planning is not None and (not planning.valid or planning.fault_code):
-            self._latch(planning.fault_code or "PLANNING_INVALID")
-        if actuation is not None and (not actuation.valid or actuation.fault_code):
-            self._latch(actuation.fault_code or "ACTUATION_INVALID")
-        faults = list(self.latched_faults)
+        now = time.time()
+        faults: List[str] = []
 
-        degrade = any(faults)
-        if degrade:
+        if perception is not None:
+            if not perception.valid or perception.fault_code:
+                self._latch(perception.fault_code or "PERCEPTION_INVALID")
+            elif (now - perception.timestamp) > self.perception_freshness_s:
+                self._latch("PERCEPTION_STALE")
+
+        if planning is not None:
+            if not planning.valid or planning.fault_code:
+                self._latch(planning.fault_code or "PLANNING_INVALID")
+            elif (now - planning.timestamp) > self.planning_freshness_s:
+                self._latch("PLANNING_STALE")
+            if ttc is None and planning.debug is not None:
+                try:
+                    ttc = float(planning.debug.get("ttc"))
+                except Exception:
+                    ttc = None
+            if ttc is not None and math.isfinite(ttc) and ttc < self.ttc_floor_s and v_ego > self.v_min_plausible:
+                self._latch("TTC_IMPLAUSIBLE")
+
+        if actuation is not None:
+            if not actuation.valid or actuation.fault_code:
+                self._latch(actuation.fault_code or "ACTUATION_INVALID")
+            elif (now - actuation.timestamp) > self.actuation_freshness_s:
+                self._latch("ACT_STALE")
+            if actuation.abs_dbg is not None:
+                slip_val = actuation.abs_dbg.get("lambda_max")
+                try:
+                    if slip_val is not None and float(slip_val) > self.wheel_slip_max:
+                        self._latch("SLIP_OUT_OF_RANGE")
+                except Exception:
+                    pass
+
+        faults = list(self.latched_faults)
+        critical = {"ACTUATION_INVALID", "ABS_FAIL", "PERCEPTION_INVALID", "PLANNING_INVALID", "SLIP_OUT_OF_RANGE"}
+
+        if any(code in critical for code in faults):
             throttle_cmd = 0.0
             brake_cmd = self.brake_fail_safe
-            mode = "DEGRADED_FAIL_SAFE"
+            mode = SafetyMode.FAIL_SAFE
+        elif faults:
+            throttle_cmd = 0.0 if planning is None else min(planning.throttle, 0.25)
+            brake_cmd = 0.0 if planning is None else max(planning.brake, 0.25)
+            mode = SafetyMode.DEGRADED
         else:
             throttle_cmd = planning.throttle if planning is not None else 0.0
             brake_cmd = planning.brake if planning is not None else 0.0
-            mode = "NOMINAL"
+            mode = SafetyMode.NOMINAL
 
-        return SafetyDecision(throttle=throttle_cmd, brake=brake_cmd, mode=mode, faults=faults)
+        return SafetyDecision(
+            throttle=throttle_cmd,
+            brake=brake_cmd,
+            mode=mode,
+            faults=faults,
+            latched=list(self.latched_faults),
+        )
 
